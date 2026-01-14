@@ -245,6 +245,10 @@ def imou_list_device_details_by_ids(device_ids: list[str]) -> list[dict]:
     data = imou_post("listDeviceDetailsByIds", {"token": token, "deviceList": payload_list})
     return data.get("deviceList", []) or []
 
+def imou_get_message_callback():
+    token = imou_get_admin_token()
+    return imou_post("getMessageCallback", {"token": token})
+
 # -----------------------------
 # Admin protection
 # -----------------------------
@@ -261,6 +265,12 @@ def require_admin():
 @app.get("/health")
 def health():
     return "ok", 200
+
+@app.get("/admin/get-callback")
+def admin_get_callback():
+    require_admin()
+    return jsonify(imou_get_message_callback())
+
 
 @app.get("/api/status")
 def api_status():

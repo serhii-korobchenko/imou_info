@@ -73,6 +73,14 @@ def db_init():
             received_at_utc TEXT,
             raw_json TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS callback_inbox (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              received_at_utc TEXT,
+              headers_json TEXT,
+              body_text TEXT
+        );
+
         """
     )
     conn.commit()
@@ -158,6 +166,18 @@ def get_recent_events(limit=50):
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+def save_callback_inbox(headers: dict, body_text: str):
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO callback_inbox(received_at_utc, headers_json, body_text) VALUES(?,?,?)",
+        (now_utc_iso(), json.dumps(headers, ensure_ascii=False), body_text),
+    )
+    # тримаємо останні 200 записів
+    conn.execute("DELETE FROM callback_inbox WHERE id NOT IN (SELECT id FROM callback_inbox ORDER BY id DESC LIMIT 200)")
+    conn.commit()
+    conn.close()
+
 
 # -----------------------------
 # Imou Open Platform client
@@ -296,6 +316,18 @@ def callback_endpoint() -> str:
         except Exception:
             base = ""
     return f"{base}/imou/callback" if base else "/imou/callback"
+
+
+@app.get("/admin/last-callbacks")
+def admin_last_callbacks():
+    require_admin()
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT id, received_at_utc, body_text FROM callback_inbox ORDER BY id DESC LIMIT 20"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
 
 @app.get("/")
 def index():
@@ -464,70 +496,56 @@ def index():
 
 @app.post("/imou/callback")
 def imou_callback():
-    """
-    Imou event push callback.
-    Example device status push uses msgType=deviceStatus with status online/offline :contentReference[oaicite:8]{index=8}
-    Alarm example uses msgType=alarm :contentReference[oaicite:9]{index=9}
+    raw_text = request.get_data(as_text=True) or ""
+    save_callback_inbox(dict(request.headers), raw_text)
 
-    IMPORTANT: Must return HTTP 200 or Imou may stop pushing :contentReference[oaicite:10]{index=10}
-    """
-    raw = request.get_json(silent=True)
-    if raw is None:
-        # sometimes webhook providers send text/plain
-        try:
-            raw = json.loads(request.data.decode("utf-8") or "{}")
-        except Exception:
-            raw = {}
+    # завжди 200
+    try:
+        raw = request.get_json(silent=True)
+        if raw is None:
+            raw = json.loads(raw_text or "{}")
 
-    # Allow either a single dict or list of dicts
-    messages = raw if isinstance(raw, list) else [raw]
+        # інколи корисні дані в params
+        if isinstance(raw, dict) and isinstance(raw.get("params"), dict):
+            raw = raw["params"]
 
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
+        messages = raw if isinstance(raw, list) else [raw]
 
-        msg_type = (msg.get("msgType") or msg.get("type") or "").strip()
-        device_id = (msg.get("deviceId") or msg.get("device_id") or "").strip()
-        occur_time = msg.get("occurTime") or msg.get("time") or ""
+        for msg in messages:
+            if not isinstance(msg, dict):
+                # все одно збережемо як event
+                add_event("__unknown__", "raw", "non-dict payload", "", {"raw": raw_text})
+                continue
 
-        if not device_id:
-            continue
-
-        summary = ""
-        status = None
-
-        if msg_type == "deviceStatus":
-            # "online"/"offline" (push format) :contentReference[oaicite:11]{index=11}
-            status = (msg.get("status") or "").strip().lower() or "unknown"
-            ch = msg.get("channelId")
-            summary = f"deviceStatus: {status}" + (f" (ch {ch})" if ch is not None else "")
-            upsert_device(
-                device_id,
-                status=status,
-                last_seen_utc=now_utc_iso(),
-                last_event_summary=summary,
+            device_id = (
+                (msg.get("deviceId") or "").strip()
+                or (msg.get("did") or "").strip()
+                or "__unknown__"
             )
+            msg_type = (msg.get("msgType") or msg.get("type") or "unknown").strip()
+            occur_time = str(msg.get("occurTime") or msg.get("time") or "")
 
-        elif msg_type == "alarm":
-            # Push alarm has alarmName/alarmType + deviceId/channelId :contentReference[oaicite:12]{index=12}
-            alarm_name = msg.get("alarmName") or ""
-            alarm_type = msg.get("alarmType") or ""
-            ch = msg.get("channelId")
-            summary = f"alarm: {alarm_name} ({alarm_type})" + (f" (ch {ch})" if ch is not None else "")
-            upsert_device(
-                device_id,
-                last_seen_utc=now_utc_iso(),
-                last_event_summary=summary,
-            )
+            # нормалізація статусу
+            status = ""
+            if msg_type in ("online", "offline"):
+                status = msg_type
+                summary = f"deviceStatus: {status}"
+            elif msg_type == "deviceStatus":
+                status = (msg.get("status") or "").strip().lower()
+                summary = f"deviceStatus: {status or 'unknown'}"
+            elif msg_type == "alarm":
+                summary = f"alarm: {(msg.get('alarmName') or '')} {(msg.get('alarmType') or '')}".strip()
+            else:
+                summary = msg_type
 
-        else:
-            # Store unknown message types too
-            summary = f"{msg_type or 'unknown'} event"
-            upsert_device(device_id, last_seen_utc=now_utc_iso(), last_event_summary=summary)
+            add_event(device_id, msg_type, summary, occur_time, msg)
+            upsert_device(device_id, status=status, last_seen_utc=now_utc_iso(), last_event_summary=summary)
 
-        add_event(device_id, msg_type or "unknown", summary, str(occur_time), msg)
+    except Exception:
+        app.logger.exception("IMOU CALLBACK processing error")
 
     return "OK", 200
+
 
 # -----------------------------
 # Admin endpoints

@@ -271,6 +271,11 @@ def admin_get_callback():
     require_admin()
     return jsonify(imou_get_message_callback())
 
+@app.get("/imou/callback")
+def imou_callback_health():
+    return "callback alive", 200
+
+
 
 @app.get("/api/status")
 def api_status():

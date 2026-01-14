@@ -10,22 +10,41 @@ import requests
 from flask import Flask, request, jsonify, abort, render_template_string
 
 # -----------------------------
+# Helpers
+# -----------------------------
+def env_bool(name: str, default: bool = False) -> bool:
+    v = (os.getenv(name, "") or "").strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+# -----------------------------
 # Config (Railway env vars)
 # -----------------------------
-IMOU_DATACENTER = os.getenv("IMOU_DATACENTER", "").strip()   # e.g. "eu", "us", "cn" (depends on your Imou app)
+IMOU_DATACENTER = os.getenv("IMOU_DATACENTER", "").strip()  # e.g. "fk" for Central Europe
 IMOU_APP_ID = os.getenv("IMOU_APP_ID", "").strip()
 IMOU_APP_SECRET = os.getenv("IMOU_APP_SECRET", "").strip()
 
-ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()  # protect /admin/* endpoints
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")  # e.g. https://your-service.up.railway.app
+ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 IMOU_CALLBACK_FLAGS = os.getenv("IMOU_CALLBACK_FLAGS", "alarm,deviceStatus").strip()
-IMOU_BASEPUSH = os.getenv("IMOU_BASEPUSH", "2").strip()  # per Imou docs, default "2"
+IMOU_BASEPUSH = os.getenv("IMOU_BASEPUSH", "2").strip()
+
 DATA_DIR = os.getenv("DATA_DIR", ".").strip()
 DB_PATH = os.path.join(DATA_DIR, "imou_status.sqlite3")
 
-# Optional: preconfigured device IDs (comma-separated)
 IMOU_DEVICE_IDS = [d.strip() for d in os.getenv("IMOU_DEVICE_IDS", "").split(",") if d.strip()]
+
+# Debug: store raw callback payloads into callback_inbox (keep last 200)
+DEBUG_CALLBACK_INBOX = env_bool("DEBUG_CALLBACK_INBOX", False)
+CALLBACK_INBOX_MAX = int(os.getenv("CALLBACK_INBOX_MAX", "200"))
+CALLBACK_INBOX_MAX_BODY_CHARS = int(os.getenv("CALLBACK_INBOX_MAX_BODY_CHARS", "50000"))
 
 # -----------------------------
 # Flask
@@ -39,7 +58,6 @@ def db_connect() -> sqlite3.Connection:
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    # Better concurrency
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
@@ -75,12 +93,11 @@ def db_init():
         );
 
         CREATE TABLE IF NOT EXISTS callback_inbox (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              received_at_utc TEXT,
-              headers_json TEXT,
-              body_text TEXT
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at_utc TEXT,
+            headers_json TEXT,
+            body_text TEXT
         );
-
         """
     )
     conn.commit()
@@ -102,9 +119,6 @@ def kv_set(key: str, value: str):
     )
     conn.commit()
     conn.close()
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 def upsert_device(device_id: str, **fields):
     keys = []
@@ -154,12 +168,22 @@ def get_devices():
     return [dict(r) for r in rows]
 
 def get_recent_events(limit=50):
+    """
+    IMPORTANT: Join devices to show device_name in Recent events.
+    """
     conn = db_connect()
     rows = conn.execute(
         """
-        SELECT device_id, msg_type, summary, occur_time, received_at_utc
-        FROM events
-        ORDER BY id DESC
+        SELECT
+            e.device_id,
+            COALESCE(d.device_name, '') AS device_name,
+            e.msg_type,
+            e.summary,
+            e.occur_time,
+            e.received_at_utc
+        FROM events e
+        LEFT JOIN devices d ON d.device_id = e.device_id
+        ORDER BY e.id DESC
         LIMIT ?
         """,
         (limit,),
@@ -168,16 +192,22 @@ def get_recent_events(limit=50):
     return [dict(r) for r in rows]
 
 def save_callback_inbox(headers: dict, body_text: str):
+    """
+    Store raw callback payload only when DEBUG_CALLBACK_INBOX=1
+    """
+    if not DEBUG_CALLBACK_INBOX:
+        return
+    body_text = (body_text or "")[:CALLBACK_INBOX_MAX_BODY_CHARS]
     conn = db_connect()
     conn.execute(
         "INSERT INTO callback_inbox(received_at_utc, headers_json, body_text) VALUES(?,?,?)",
         (now_utc_iso(), json.dumps(headers, ensure_ascii=False), body_text),
     )
-    # тримаємо останні 200 записів
-    conn.execute("DELETE FROM callback_inbox WHERE id NOT IN (SELECT id FROM callback_inbox ORDER BY id DESC LIMIT 200)")
+    conn.execute(
+        f"DELETE FROM callback_inbox WHERE id NOT IN (SELECT id FROM callback_inbox ORDER BY id DESC LIMIT {int(CALLBACK_INBOX_MAX)})"
+    )
     conn.commit()
     conn.close()
-
 
 # -----------------------------
 # Imou Open Platform client
@@ -188,7 +218,6 @@ def imou_base_url() -> str:
     return f"https://openapi-{IMOU_DATACENTER}.easy4ip.com/openapi"
 
 def imou_sign(app_secret: str, ts: int, nonce: str) -> str:
-    # Per Imou "Development Specification": md5("time:...,nonce:...,appSecret:...") lower-hex :contentReference[oaicite:3]{index=3}
     s = f"time:{ts},nonce:{nonce},appSecret:{app_secret}"
     return hashlib.md5(s.encode("utf-8")).hexdigest().lower()
 
@@ -215,7 +244,6 @@ def imou_post(endpoint: str, params: dict) -> dict:
     r.raise_for_status()
     data = r.json()
 
-    # Standard format: { "result": { "code":"0", "msg":"...", "data":{...}}, "id":"..." }
     result = data.get("result", {})
     code = str(result.get("code", ""))
     if code != "0":
@@ -232,18 +260,15 @@ def imou_get_admin_token() -> str:
         except Exception:
             pass
 
-    # accessToken API: no params required :contentReference[oaicite:4]{index=4}
     data = imou_post("accessToken", {})
     token = data["accessToken"]
     expire_sec = int(data.get("expireTime", 0))
-    expires_at = int(time.time()) + max(0, expire_sec) - 600  # refresh ~10 min early
-
+    expires_at = int(time.time()) + max(0, expire_sec) - 600
     kv_set("imou_access_token_json", json.dumps({"token": token, "expires_at": expires_at}))
     return token
 
 def imou_set_message_callback(callback_url: str, status: str = "on"):
     token = imou_get_admin_token()
-    # setMessageCallback requires token, status, callbackUrl, callbackFlag :contentReference[oaicite:5]{index=5}
     params = {
         "token": token,
         "status": status,
@@ -255,12 +280,10 @@ def imou_set_message_callback(callback_url: str, status: str = "on"):
 
 def imou_device_online(device_id: str) -> dict:
     token = imou_get_admin_token()
-    # deviceOnline returns onLine = 0/1/3/4 and channels[] :contentReference[oaicite:6]{index=6}
     return imou_post("deviceOnline", {"token": token, "deviceId": device_id})
 
 def imou_list_device_details_by_ids(device_ids: list[str]) -> list[dict]:
     token = imou_get_admin_token()
-    # listDeviceDetailsByIds expects deviceList with channelId list :contentReference[oaicite:7]{index=7}
     payload_list = [{"deviceId": d, "channelId": ["0"]} for d in device_ids]
     data = imou_post("listDeviceDetailsByIds", {"token": token, "deviceList": payload_list})
     return data.get("deviceList", []) or []
@@ -286,16 +309,9 @@ def require_admin():
 def health():
     return "ok", 200
 
-@app.get("/admin/get-callback")
-def admin_get_callback():
-    require_admin()
-    return jsonify(imou_get_message_callback())
-
 @app.get("/imou/callback")
 def imou_callback_health():
     return "callback alive", 200
-
-
 
 @app.get("/api/status")
 def api_status():
@@ -310,13 +326,16 @@ def api_status():
 def callback_endpoint() -> str:
     base = PUBLIC_BASE_URL
     if not base:
-        # Best effort: derive from request if available
         try:
             base = request.url_root.rstrip("/")
         except Exception:
             base = ""
     return f"{base}/imou/callback" if base else "/imou/callback"
 
+@app.get("/admin/get-callback")
+def admin_get_callback():
+    require_admin()
+    return jsonify(imou_get_message_callback())
 
 @app.get("/admin/last-callbacks")
 def admin_last_callbacks():
@@ -328,6 +347,23 @@ def admin_last_callbacks():
     conn.close()
     return jsonify([dict(r) for r in rows])
 
+@app.post("/admin/clear-events")
+def admin_clear_events():
+    require_admin()
+    conn = db_connect()
+    conn.execute("DELETE FROM events")
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "cleared": "events"})
+
+@app.post("/admin/clear-callback-inbox")
+def admin_clear_callback_inbox():
+    require_admin()
+    conn = db_connect()
+    conn.execute("DELETE FROM callback_inbox")
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "cleared": "callback_inbox"})
 
 @app.get("/")
 def index():
@@ -366,7 +402,7 @@ def index():
       <div><b>Message Callback Address</b></div>
       <div class="muted">Set this URL in Imou (or call <code>/admin/set-callback</code>):</div>
       <div style="margin-top:8px;"><code id="cb">{{ cb }}</code></div>
-      <div class="muted" style="margin-top:8px;">Your callback must return HTTP 200 for Imou to keep pushing events.</div>
+      <div class="muted" style="margin-top:8px;">Callback must return HTTP 200.</div>
     </div>
 
     <div class="card">
@@ -380,8 +416,13 @@ def index():
         <input id="cburl" value="{{ cb }}" />
         <button onclick="adminPost('/admin/set-callback', {callback_url: document.getElementById('cburl').value})">Set callback</button>
       </div>
+      <div style="margin-top:10px;">
+        <div class="muted">Maintenance:</div>
+        <button onclick="adminPost('/admin/clear-events')">Clear events</button>
+        <button onclick="adminPost('/admin/clear-callback-inbox')">Clear callback inbox</button>
+      </div>
       <div class="muted" style="margin-top:10px;">
-        Tip: pass admin key header <code>X-Admin-Key</code> (handled by the JS button).
+        Tip: pass admin key header <code>X-Admin-Key</code>.
       </div>
     </div>
   </div>
@@ -424,10 +465,17 @@ def index():
         <th>Received (UTC)</th>
       </tr>
     </thead>
-    <tbody>
+    <tbody id="eventrows">
       {% for e in events %}
       <tr>
-        <td><code>{{ e.device_id }}</code></td>
+        <td>
+          {% if e.device_name %}
+            {{ e.device_name }}
+            <div class="muted"><code>{{ e.device_id }}</code></div>
+          {% else %}
+            <code>{{ e.device_id }}</code>
+          {% endif %}
+        </td>
         <td>{{ e.msg_type }}</td>
         <td class="muted">{{ e.summary }}</td>
         <td class="muted">{{ e.occur_time }}</td>
@@ -438,10 +486,10 @@ def index():
   </table>
 
 <script>
-  const ADMIN_KEY = "{{ admin_key_present }}";
+  const ADMIN_KEY_PRESENT = "{{ admin_key_present }}";
 
   async function adminPost(path, body) {
-    if (!ADMIN_KEY) {
+    if (!ADMIN_KEY_PRESENT) {
       alert("ADMIN_KEY is not set on server.");
       return;
     }
@@ -458,12 +506,20 @@ def index():
     else location.reload();
   }
 
-  // Simple auto-refresh every 10s
+  function esc(s) {
+    return (s ?? "").toString()
+      .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  }
+
+  // Auto-refresh every 10s: Devices + Recent events
   setInterval(async () => {
     try {
       const r = await fetch("/api/status");
       if (!r.ok) return;
       const data = await r.json();
+
+      // Devices
       const tbody = document.getElementById("devrows");
       tbody.innerHTML = "";
       (data.devices || []).forEach(d => {
@@ -473,14 +529,33 @@ def index():
         const cls = ok ? "ok" : (bad ? "bad" : "");
         tbody.innerHTML += `
           <tr>
-            <td>${d.device_name || ""}</td>
-            <td><code>${d.device_id}</code></td>
-            <td><span class="pill ${cls}">${st}</span></td>
-            <td class="muted">${d.last_seen_utc || ""}</td>
-            <td class="muted">${d.last_event_summary || ""}</td>
+            <td>${esc(d.device_name || "")}</td>
+            <td><code>${esc(d.device_id)}</code></td>
+            <td><span class="pill ${cls}">${esc(st)}</span></td>
+            <td class="muted">${esc(d.last_seen_utc || "")}</td>
+            <td class="muted">${esc(d.last_event_summary || "")}</td>
           </tr>`;
       });
+
+      // Callback URL
       document.getElementById("cb").textContent = data.callback_endpoint || "";
+
+      // Recent events
+      const et = document.getElementById("eventrows");
+      et.innerHTML = "";
+      (data.recent_events || []).slice(0, 30).forEach(e => {
+        const nameCell = e.device_name
+          ? `${esc(e.device_name)}<div class="muted"><code>${esc(e.device_id)}</code></div>`
+          : `<code>${esc(e.device_id)}</code>`;
+        et.innerHTML += `
+          <tr>
+            <td>${nameCell}</td>
+            <td>${esc(e.msg_type || "")}</td>
+            <td class="muted">${esc(e.summary || "")}</td>
+            <td class="muted">${esc(e.occur_time || "")}</td>
+            <td class="muted">${esc(e.received_at_utc || "")}</td>
+          </tr>`;
+      });
     } catch (e) {}
   }, 10000);
 </script>
@@ -499,13 +574,11 @@ def imou_callback():
     raw_text = request.get_data(as_text=True) or ""
     save_callback_inbox(dict(request.headers), raw_text)
 
-    # завжди 200
     try:
         raw = request.get_json(silent=True)
         if raw is None:
             raw = json.loads(raw_text or "{}")
 
-        # інколи корисні дані в params
         if isinstance(raw, dict) and isinstance(raw.get("params"), dict):
             raw = raw["params"]
 
@@ -513,7 +586,6 @@ def imou_callback():
 
         for msg in messages:
             if not isinstance(msg, dict):
-                # все одно збережемо як event
                 add_event("__unknown__", "raw", "non-dict payload", "", {"raw": raw_text})
                 continue
 
@@ -525,7 +597,6 @@ def imou_callback():
             msg_type = (msg.get("msgType") or msg.get("type") or "unknown").strip()
             occur_time = str(msg.get("occurTime") or msg.get("time") or "")
 
-            # нормалізація статусу
             status = ""
             if msg_type in ("online", "offline"):
                 status = msg_type
@@ -546,7 +617,6 @@ def imou_callback():
 
     return "OK", 200
 
-
 # -----------------------------
 # Admin endpoints
 # -----------------------------
@@ -566,8 +636,6 @@ def admin_sync():
     require_admin()
 
     if not IMOU_DEVICE_IDS:
-        # If you want auto-discovery, you can add listDeviceDetailsByPage/deviceBaseList later.
-        # For now, sync requires IMOU_DEVICE_IDS env var.
         abort(400, description="Set IMOU_DEVICE_IDS (comma-separated) to use /admin/sync")
 
     details = imou_list_device_details_by_ids(IMOU_DEVICE_IDS)
@@ -577,7 +645,7 @@ def admin_sync():
             continue
 
         device_name = d.get("deviceName") or ""
-        device_status = d.get("deviceStatus") or "unknown"  # online/offline/sleep/upgrading :contentReference[oaicite:13]{index=13}
+        device_status = d.get("deviceStatus") or "unknown"
 
         channel_list = d.get("channelList") or []
         channel_status = {}
@@ -593,9 +661,8 @@ def admin_sync():
             last_seen_utc=now_utc_iso(),
         )
 
-        # Also refresh real-time online numeric status (optional)
         try:
-            online = imou_device_online(device_id)  # returns onLine=0/1/3/4 :contentReference[oaicite:14]{index=14}
+            online = imou_device_online(device_id)
             upsert_device(
                 device_id,
                 status=str(online.get("onLine", device_status)),

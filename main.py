@@ -4,10 +4,16 @@ import time
 import uuid
 import hashlib
 import sqlite3
+import base64
 from datetime import datetime, timezone
 
 import requests
 from flask import Flask, request, jsonify, abort, render_template_string
+
+# Google APIs
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
 
 # -----------------------------
 # Helpers
@@ -20,8 +26,14 @@ def env_bool(name: str, default: bool = False) -> bool:
         return False
     return default
 
+
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
 
 # -----------------------------
 # Config (Railway env vars)
@@ -47,6 +59,28 @@ CALLBACK_INBOX_MAX = int(os.getenv("CALLBACK_INBOX_MAX", "200"))
 CALLBACK_INBOX_MAX_BODY_CHARS = int(os.getenv("CALLBACK_INBOX_MAX_BODY_CHARS", "50000"))
 
 # -----------------------------
+# Google Drive / Sheets config
+# -----------------------------
+# Auth, як у example.py: base64 service-account json
+GDRIVE_SA_JSON_B64 = os.getenv("GDRIVE_SA_JSON_B64", "").strip()
+
+# ДЕ лежить папка imou_project:
+# 1) найкраще: одразу ID папки imou_project
+GDRIVE_IMOU_PROJECT_FOLDER_ID = os.getenv("GDRIVE_IMOU_PROJECT_FOLDER_ID", "").strip()
+# 2) або ID "root parent", де ми створимо/знайдемо папку "imou_project"
+GDRIVE_ROOT_FOLDER_ID = os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
+
+# Spreadsheet
+GDRIVE_EVENTS_SPREADSHEET_ID = os.getenv("GDRIVE_EVENTS_SPREADSHEET_ID", "").strip()
+GDRIVE_EVENTS_SPREADSHEET_NAME = os.getenv("GDRIVE_EVENTS_SPREADSHEET_NAME", "imou_events").strip()
+GDRIVE_EVENTS_TAB_NAME = os.getenv("GDRIVE_EVENTS_TAB_NAME", "Events").strip()
+
+# batching/throttle
+GDRIVE_EVENTS_APPEND_BATCH = int(os.getenv("GDRIVE_EVENTS_APPEND_BATCH", "50"))
+GDRIVE_FLUSH_INTERVAL_SEC = int(os.getenv("GDRIVE_FLUSH_INTERVAL_SEC", "5"))
+GDRIVE_EVENTS_ENABLED = env_bool("GDRIVE_EVENTS_ENABLED", True)
+
+# -----------------------------
 # Flask
 # -----------------------------
 app = Flask(__name__)
@@ -62,6 +96,7 @@ def db_connect() -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
     return conn
+
 
 def db_init():
     conn = db_connect()
@@ -98,18 +133,32 @@ def db_init():
             headers_json TEXT,
             body_text TEXT
         );
+
+        -- Queue for Google Sheets (stores ALL events independently from events retention)
+        CREATE TABLE IF NOT EXISTS sheet_queue (
+            uid TEXT PRIMARY KEY,
+            row_json TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            sent INTEGER NOT NULL DEFAULT 0,
+            sent_at_utc TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sheet_queue_sent_created
+            ON sheet_queue(sent, created_at_utc);
         """
     )
     conn.commit()
     conn.close()
 
+
 db_init()
+
 
 def kv_get(key: str):
     conn = db_connect()
     row = conn.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
     conn.close()
     return None if not row else row["v"]
+
 
 def kv_set(key: str, value: str):
     conn = db_connect()
@@ -119,6 +168,7 @@ def kv_set(key: str, value: str):
     )
     conn.commit()
     conn.close()
+
 
 def upsert_device(device_id: str, **fields):
     keys = []
@@ -141,19 +191,52 @@ def upsert_device(device_id: str, **fields):
     conn.commit()
     conn.close()
 
+
+def get_device_name(device_id: str) -> str:
+    conn = db_connect()
+    row = conn.execute("SELECT device_name FROM devices WHERE device_id=?", (device_id,)).fetchone()
+    conn.close()
+    if not row:
+        return ""
+    return (row["device_name"] or "").strip()
+
+
 def add_event(device_id: str, msg_type: str, summary: str, occur_time: str, raw: dict):
+    """
+    1) Store in SQLite (keep last 5000)
+    2) Store in sheet_queue (keeps ALL events)
+    3) Try flush to Google Sheets (best-effort)
+    """
+    received_at = now_utc_iso()
+    raw_json = json.dumps(raw, ensure_ascii=False)
+
+    # ---- (A) SQLite events (keeps only last 5000) ----
     conn = db_connect()
     conn.execute(
         """
         INSERT INTO events(device_id,msg_type,summary,occur_time,received_at_utc,raw_json)
         VALUES(?,?,?,?,?,?)
         """,
-        (device_id, msg_type, summary, occur_time, now_utc_iso(), json.dumps(raw, ensure_ascii=False)),
+        (device_id, msg_type, summary, occur_time, received_at, raw_json),
     )
-    # keep only last 5000 events
     conn.execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 5000)")
     conn.commit()
     conn.close()
+
+    # ---- (B) Google Sheets queue (keeps ALL) ----
+    enqueue_event_for_sheets(
+        device_id=device_id,
+        device_name=get_device_name(device_id),
+        msg_type=msg_type,
+        summary=summary,
+        occur_time=occur_time,
+        received_at_utc=received_at,
+        raw_json=raw_json,
+    )
+
+    # ---- (C) Best-effort flush with throttle ----
+    maybe_flush_sheets()
+
 
 def get_devices():
     conn = db_connect()
@@ -167,9 +250,10 @@ def get_devices():
     conn.close()
     return [dict(r) for r in rows]
 
+
 def get_recent_events(limit=50):
     """
-    IMPORTANT: Join devices to show device_name in Recent events.
+    Join devices to show device_name in Recent events.
     """
     conn = db_connect()
     rows = conn.execute(
@@ -191,6 +275,7 @@ def get_recent_events(limit=50):
     conn.close()
     return [dict(r) for r in rows]
 
+
 def save_callback_inbox(headers: dict, body_text: str):
     """
     Store raw callback payload only when DEBUG_CALLBACK_INBOX=1
@@ -209,6 +294,313 @@ def save_callback_inbox(headers: dict, body_text: str):
     conn.commit()
     conn.close()
 
+
+# -----------------------------
+# Google Drive / Sheets helpers
+# -----------------------------
+DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+_drive_service = None
+_sheets_service = None
+
+_last_flush_ts = 0.0
+
+
+def google_enabled() -> bool:
+    return GDRIVE_EVENTS_ENABLED and bool(GDRIVE_SA_JSON_B64)
+
+
+def get_drive_service():
+    global _drive_service
+    if _drive_service is not None:
+        return _drive_service
+    if not GDRIVE_SA_JSON_B64:
+        raise RuntimeError("Missing GDRIVE_SA_JSON_B64")
+    sa_info = json.loads(base64.b64decode(GDRIVE_SA_JSON_B64).decode("utf-8"))
+    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=DRIVE_SCOPES)
+    _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return _drive_service
+
+
+def get_sheets_service():
+    global _sheets_service
+    if _sheets_service is not None:
+        return _sheets_service
+    if not GDRIVE_SA_JSON_B64:
+        raise RuntimeError("Missing GDRIVE_SA_JSON_B64")
+    sa_info = json.loads(base64.b64decode(GDRIVE_SA_JSON_B64).decode("utf-8"))
+    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=DRIVE_SCOPES)
+    _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return _sheets_service
+
+
+def drive_find_file_id(service, folder_id: str, name: str, mime_type: str | None = None):
+    q = f"'{folder_id}' in parents and name='{name}' and trashed=false"
+    if mime_type:
+        q += f" and mimeType='{mime_type}'"
+    res = service.files().list(q=q, fields="files(id,name,mimeType)").execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def drive_ensure_folder(service, parent_id: str, folder_name: str) -> str:
+    q = (
+        f"'{parent_id}' in parents and trashed=false and "
+        f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}'"
+    )
+    res = service.files().list(q=q, fields="files(id,name)").execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    created = service.files().create(
+        body={
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        },
+        fields="id",
+    ).execute()
+    return created["id"]
+
+
+def resolve_imou_project_folder_id() -> str:
+    """
+    Priority:
+    1) GDRIVE_IMOU_PROJECT_FOLDER_ID
+    2) ensure folder 'imou_project' inside GDRIVE_ROOT_FOLDER_ID
+    """
+    if GDRIVE_IMOU_PROJECT_FOLDER_ID:
+        return GDRIVE_IMOU_PROJECT_FOLDER_ID
+
+    if not GDRIVE_ROOT_FOLDER_ID:
+        raise RuntimeError(
+            "Set GDRIVE_IMOU_PROJECT_FOLDER_ID (recommended) or GDRIVE_ROOT_FOLDER_ID (to create/find 'imou_project')."
+        )
+
+    drive = get_drive_service()
+    return drive_ensure_folder(drive, GDRIVE_ROOT_FOLDER_ID, "imou_project")
+
+
+def drive_create_spreadsheet(service, folder_id: str, name: str) -> str:
+    created = service.files().create(
+        body={
+            "name": name,
+            "mimeType": "application/vnd.google-apps.spreadsheet",
+            "parents": [folder_id],
+        },
+        fields="id",
+    ).execute()
+    return created["id"]
+
+
+def ensure_events_spreadsheet_id() -> str:
+    """
+    Returns spreadsheet id:
+    - env GDRIVE_EVENTS_SPREADSHEET_ID, else:
+    - find by name in imou_project folder, else create
+    Caches into kv.
+    """
+    if GDRIVE_EVENTS_SPREADSHEET_ID:
+        return GDRIVE_EVENTS_SPREADSHEET_ID
+
+    cached = kv_get("gsheet_events_spreadsheet_id")
+    if cached:
+        return cached
+
+    drive = get_drive_service()
+    folder_id = resolve_imou_project_folder_id()
+
+    sid = drive_find_file_id(
+        drive,
+        folder_id,
+        GDRIVE_EVENTS_SPREADSHEET_NAME,
+        mime_type="application/vnd.google-apps.spreadsheet",
+    )
+    if not sid:
+        sid = drive_create_spreadsheet(drive, folder_id, GDRIVE_EVENTS_SPREADSHEET_NAME)
+
+    kv_set("gsheet_events_spreadsheet_id", sid)
+    return sid
+
+
+def ensure_tab_and_header():
+    """
+    Ensures sheet tab exists and first row is header.
+    Uses kv flag to avoid repeating.
+    """
+    sid = ensure_events_spreadsheet_id()
+    sheets = get_sheets_service()
+
+    header_done = kv_get("gsheet_events_header_done")
+    if header_done == "1":
+        return
+
+    # Check existing tabs
+    meta = sheets.spreadsheets().get(spreadsheetId=sid).execute()
+    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if GDRIVE_EVENTS_TAB_NAME not in tabs:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": [{"addSheet": {"properties": {"title": GDRIVE_EVENTS_TAB_NAME}}}]},
+        ).execute()
+
+    # Write header row A1:G1
+    header = [
+        "received_at_utc",
+        "occur_time",
+        "device_id",
+        "device_name",
+        "msg_type",
+        "summary",
+        "raw_json",
+    ]
+    sheets.spreadsheets().values().update(
+        spreadsheetId=sid,
+        range=f"{GDRIVE_EVENTS_TAB_NAME}!A1:G1",
+        valueInputOption="RAW",
+        body={"values": [header]},
+    ).execute()
+
+    kv_set("gsheet_events_header_done", "1")
+
+
+def enqueue_event_for_sheets(
+    device_id: str,
+    device_name: str,
+    msg_type: str,
+    summary: str,
+    occur_time: str,
+    received_at_utc: str,
+    raw_json: str,
+):
+    """
+    Insert-or-ignore into sheet_queue. This is the durable "ALL events" store (independent from events retention).
+    """
+    uid_src = f"{received_at_utc}|{occur_time}|{device_id}|{msg_type}|{summary}"
+    uid = sha256_hex(uid_src)
+
+    row = {
+        "received_at_utc": received_at_utc,
+        "occur_time": occur_time,
+        "device_id": device_id,
+        "device_name": device_name or "",
+        "msg_type": msg_type,
+        "summary": summary,
+        "raw_json": raw_json,
+    }
+
+    conn = db_connect()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO sheet_queue(uid,row_json,created_at_utc,sent,sent_at_utc)
+        VALUES(?,?,?,0,NULL)
+        """,
+        (uid, json.dumps(row, ensure_ascii=False), now_utc_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def sheets_queue_stats() -> dict:
+    conn = db_connect()
+    total = conn.execute("SELECT COUNT(1) AS c FROM sheet_queue").fetchone()["c"]
+    unsent = conn.execute("SELECT COUNT(1) AS c FROM sheet_queue WHERE sent=0").fetchone()["c"]
+    conn.close()
+    return {"total": int(total), "unsent": int(unsent)}
+
+
+def flush_sheets(max_rows: int | None = None) -> dict:
+    """
+    Flush unsent rows to Google Sheets.
+    """
+    if not google_enabled():
+        return {"ok": False, "reason": "google disabled or missing GDRIVE_SA_JSON_B64"}
+
+    try:
+        ensure_tab_and_header()
+        sid = ensure_events_spreadsheet_id()
+        sheets = get_sheets_service()
+
+        limit = max_rows or GDRIVE_EVENTS_APPEND_BATCH
+
+        conn = db_connect()
+        rows = conn.execute(
+            "SELECT uid, row_json FROM sheet_queue WHERE sent=0 ORDER BY created_at_utc ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            return {"ok": True, "flushed": 0}
+
+        values = []
+        uids = []
+        for r in rows:
+            uids.append(r["uid"])
+            obj = json.loads(r["row_json"])
+            values.append(
+                [
+                    obj.get("received_at_utc", ""),
+                    obj.get("occur_time", ""),
+                    obj.get("device_id", ""),
+                    obj.get("device_name", ""),
+                    obj.get("msg_type", ""),
+                    obj.get("summary", ""),
+                    obj.get("raw_json", ""),
+                ]
+            )
+
+        # Append after header (A2)
+        sheets.spreadsheets().values().append(
+            spreadsheetId=sid,
+            range=f"{GDRIVE_EVENTS_TAB_NAME}!A2",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": values},
+        ).execute()
+
+        # Mark sent
+        conn = db_connect()
+        now_sent = now_utc_iso()
+        conn.executemany(
+            "UPDATE sheet_queue SET sent=1, sent_at_utc=? WHERE uid=?",
+            [(now_sent, uid) for uid in uids],
+        )
+        conn.commit()
+        conn.close()
+
+        return {"ok": True, "flushed": len(uids)}
+    except Exception as e:
+        # Don't fail main flow
+        return {"ok": False, "error": str(e)}
+
+
+def maybe_flush_sheets():
+    global _last_flush_ts
+    if not google_enabled():
+        return
+
+    # throttle
+    now_ts = time.time()
+    if now_ts - _last_flush_ts < max(1, GDRIVE_FLUSH_INTERVAL_SEC):
+        return
+
+    st = sheets_queue_stats()
+    # flush if we have any unsent
+    if st["unsent"] <= 0:
+        _last_flush_ts = now_ts
+        return
+
+    res = flush_sheets(GDRIVE_EVENTS_APPEND_BATCH)
+    _last_flush_ts = now_ts
+    if not res.get("ok"):
+        # keep quiet, but log to app logger
+        app.logger.warning(f"Google Sheets flush failed: {res}")
+
+
 # -----------------------------
 # Imou Open Platform client
 # -----------------------------
@@ -217,9 +609,11 @@ def imou_base_url() -> str:
         raise RuntimeError("IMOU_DATACENTER is not set")
     return f"https://openapi-{IMOU_DATACENTER}.easy4ip.com/openapi"
 
+
 def imou_sign(app_secret: str, ts: int, nonce: str) -> str:
     s = f"time:{ts},nonce:{nonce},appSecret:{app_secret}"
     return hashlib.md5(s.encode("utf-8")).hexdigest().lower()
+
 
 def imou_post(endpoint: str, params: dict) -> dict:
     if not IMOU_APP_ID or not IMOU_APP_SECRET:
@@ -250,6 +644,7 @@ def imou_post(endpoint: str, params: dict) -> dict:
         raise RuntimeError(f"Imou API error {code}: {result.get('msg')}")
     return result.get("data", {}) or {}
 
+
 def imou_get_admin_token() -> str:
     cached = kv_get("imou_access_token_json")
     if cached:
@@ -267,6 +662,7 @@ def imou_get_admin_token() -> str:
     kv_set("imou_access_token_json", json.dumps({"token": token, "expires_at": expires_at}))
     return token
 
+
 def imou_set_message_callback(callback_url: str, status: str = "on"):
     token = imou_get_admin_token()
     params = {
@@ -278,9 +674,11 @@ def imou_set_message_callback(callback_url: str, status: str = "on"):
     }
     imou_post("setMessageCallback", params)
 
+
 def imou_device_online(device_id: str) -> dict:
     token = imou_get_admin_token()
     return imou_post("deviceOnline", {"token": token, "deviceId": device_id})
+
 
 def imou_list_device_details_by_ids(device_ids: list[str]) -> list[dict]:
     token = imou_get_admin_token()
@@ -288,9 +686,11 @@ def imou_list_device_details_by_ids(device_ids: list[str]) -> list[dict]:
     data = imou_post("listDeviceDetailsByIds", {"token": token, "deviceList": payload_list})
     return data.get("deviceList", []) or []
 
+
 def imou_get_message_callback():
     token = imou_get_admin_token()
     return imou_post("getMessageCallback", {"token": token})
+
 
 # -----------------------------
 # Admin protection
@@ -302,6 +702,7 @@ def require_admin():
     if key != ADMIN_KEY:
         abort(401)
 
+
 # -----------------------------
 # Routes
 # -----------------------------
@@ -309,9 +710,11 @@ def require_admin():
 def health():
     return "ok", 200
 
+
 @app.get("/imou/callback")
 def imou_callback_health():
     return "callback alive", 200
+
 
 @app.get("/api/status")
 def api_status():
@@ -320,8 +723,15 @@ def api_status():
             "callback_endpoint": callback_endpoint(),
             "devices": get_devices(),
             "recent_events": get_recent_events(50),
+            "gsheets": {
+                "enabled": google_enabled(),
+                "queue": sheets_queue_stats(),
+                "spreadsheet_id": (GDRIVE_EVENTS_SPREADSHEET_ID or kv_get("gsheet_events_spreadsheet_id") or ""),
+                "tab": GDRIVE_EVENTS_TAB_NAME,
+            },
         }
     )
+
 
 def callback_endpoint() -> str:
     base = PUBLIC_BASE_URL
@@ -332,10 +742,12 @@ def callback_endpoint() -> str:
             base = ""
     return f"{base}/imou/callback" if base else "/imou/callback"
 
+
 @app.get("/admin/get-callback")
 def admin_get_callback():
     require_admin()
     return jsonify(imou_get_message_callback())
+
 
 @app.get("/admin/last-callbacks")
 def admin_last_callbacks():
@@ -347,6 +759,7 @@ def admin_last_callbacks():
     conn.close()
     return jsonify([dict(r) for r in rows])
 
+
 @app.post("/admin/clear-events")
 def admin_clear_events():
     require_admin()
@@ -355,6 +768,7 @@ def admin_clear_events():
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "cleared": "events"})
+
 
 @app.post("/admin/clear-callback-inbox")
 def admin_clear_callback_inbox():
@@ -365,10 +779,45 @@ def admin_clear_callback_inbox():
     conn.close()
     return jsonify({"ok": True, "cleared": "callback_inbox"})
 
+
+@app.get("/admin/gsheets-status")
+def admin_gsheets_status():
+    require_admin()
+    return jsonify(
+        {
+            "enabled": google_enabled(),
+            "queue": sheets_queue_stats(),
+            "spreadsheet_id": (GDRIVE_EVENTS_SPREADSHEET_ID or kv_get("gsheet_events_spreadsheet_id") or ""),
+            "tab": GDRIVE_EVENTS_TAB_NAME,
+            "folder_id": (GDRIVE_IMOU_PROJECT_FOLDER_ID or ""),
+        }
+    )
+
+
+@app.post("/admin/flush-sheets")
+def admin_flush_sheets():
+    require_admin()
+    body = request.get_json(silent=True) or {}
+    n = int(body.get("max_rows", 0) or 0)
+    res = flush_sheets(n if n > 0 else None)
+    return jsonify(res)
+
+
+@app.post("/admin/clear-sheets-queue")
+def admin_clear_sheets_queue():
+    require_admin()
+    conn = db_connect()
+    conn.execute("DELETE FROM sheet_queue")
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "cleared": "sheet_queue"})
+
+
 @app.get("/")
 def index():
     devices = get_devices()
     events = get_recent_events(30)
+    gs = {"enabled": google_enabled(), "queue": sheets_queue_stats()}
     return render_template_string(
         """
 <!doctype html>
@@ -406,6 +855,13 @@ def index():
     </div>
 
     <div class="card">
+      <div><b>Google Sheets events</b></div>
+      <div class="muted">Enabled: <b>{{ "yes" if gs.enabled else "no" }}</b></div>
+      <div class="muted">Queue (unsent/total): <b>{{ gs.queue.unsent }}</b> / <b>{{ gs.queue.total }}</b></div>
+      <div class="muted" style="margin-top:8px;">Stores ALL events (independent from SQLite retention).</div>
+    </div>
+
+    <div class="card">
       <div><b>Admin tools</b> <span class="muted">(requires ADMIN_KEY)</span></div>
       <div style="margin-top:10px;">
         <div class="muted">Sync device details (optional):</div>
@@ -415,6 +871,11 @@ def index():
         <div class="muted">Set Imou callback URL (optional):</div>
         <input id="cburl" value="{{ cb }}" />
         <button onclick="adminPost('/admin/set-callback', {callback_url: document.getElementById('cburl').value})">Set callback</button>
+      </div>
+      <div style="margin-top:10px;">
+        <div class="muted">Google Sheets:</div>
+        <button onclick="adminPost('/admin/flush-sheets')">Flush sheets</button>
+        <button onclick="adminPost('/admin/clear-sheets-queue')">Clear sheets queue</button>
       </div>
       <div style="margin-top:10px;">
         <div class="muted">Maintenance:</div>
@@ -567,7 +1028,9 @@ def index():
         events=events,
         cb=callback_endpoint(),
         admin_key_present=("yes" if ADMIN_KEY else ""),
+        gs=gs,
     )
+
 
 @app.post("/imou/callback")
 def imou_callback():
@@ -594,6 +1057,12 @@ def imou_callback():
                 or (msg.get("did") or "").strip()
                 or "__unknown__"
             )
+
+            # If callback sometimes includes deviceName, store it immediately
+            device_name = (msg.get("deviceName") or msg.get("device_name") or "").strip()
+            if device_name and device_id and device_id != "__unknown__":
+                upsert_device(device_id, device_name=device_name)
+
             msg_type = (msg.get("msgType") or msg.get("type") or "unknown").strip()
             occur_time = str(msg.get("occurTime") or msg.get("time") or "")
 
@@ -617,6 +1086,7 @@ def imou_callback():
 
     return "OK", 200
 
+
 # -----------------------------
 # Admin endpoints
 # -----------------------------
@@ -630,6 +1100,7 @@ def admin_set_callback():
 
     imou_set_message_callback(cb, status="on")
     return jsonify({"ok": True, "callback_url": cb, "flags": IMOU_CALLBACK_FLAGS})
+
 
 @app.post("/admin/sync")
 def admin_sync():
@@ -672,6 +1143,7 @@ def admin_sync():
             pass
 
     return jsonify({"ok": True, "synced": len(details)})
+
 
 # -----------------------------
 # Entrypoint

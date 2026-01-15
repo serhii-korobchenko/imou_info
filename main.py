@@ -61,6 +61,19 @@ DB_PATH = os.path.join(DATA_DIR, "imou_status.sqlite3")
 
 IMOU_DEVICE_IDS = [d.strip() for d in os.getenv("IMOU_DEVICE_IDS", "").split(",") if d.strip()]
 
+
+# -----------------------------
+# Telegram notifications
+# -----------------------------
+TELEGRAM_ENABLED = env_bool("TELEGRAM_ENABLED", False)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # channel username (@xxx) or numeric (-100...)
+TELEGRAM_TIMEOUT_SEC = int(os.getenv("TELEGRAM_TIMEOUT_SEC", "10"))
+# Default: parking device requested by user
+TELEGRAM_PARKING_DEVICE_ID = os.getenv("TELEGRAM_PARKING_DEVICE_ID", "14062AEPBV3882A").strip()
+TELEGRAM_PARKING_DEVICE_NAME = os.getenv("TELEGRAM_PARKING_DEVICE_NAME", "Парковка").strip()
+
+
 # Debug: store raw callback payloads into callback_inbox (keep last 200)
 DEBUG_CALLBACK_INBOX = env_bool("DEBUG_CALLBACK_INBOX", False)
 CALLBACK_INBOX_MAX = int(os.getenv("CALLBACK_INBOX_MAX", "200"))
@@ -92,6 +105,59 @@ GDRIVE_EVENTS_ENABLED = env_bool("GDRIVE_EVENTS_ENABLED", True)
 # Flask
 # -----------------------------
 app = Flask(__name__)
+
+
+# -----------------------------
+# Telegram helpers (best-effort)
+# -----------------------------
+def _normalize_status(v) -> str:
+    s = ("" if v is None else str(v)).strip().lower()
+    if s in ("1", "true", "yes", "y", "on", "online"):
+        return "online"
+    if s in ("0", "false", "no", "n", "off", "offline"):
+        return "offline"
+    return s
+
+
+def telegram_enabled() -> bool:
+    return bool(TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def telegram_send_message(text: str) -> dict:
+    """Send a plain-text message to Telegram channel/chat. Never raises (best-effort)."""
+    if not telegram_enabled():
+        return {"ok": False, "reason": "telegram disabled or missing env"}
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        r = requests.post(url, json=payload, timeout=max(3, int(TELEGRAM_TIMEOUT_SEC or 10)))
+        if r.status_code >= 400:
+            return {"ok": False, "status": r.status_code, "error": r.text[:500]}
+        data = r.json()
+        return data if isinstance(data, dict) else {"ok": True, "raw": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def maybe_notify_telegram_device_status(device_id: str, status: str):
+    """Sends ONLY for the configured parking device, and only for online/offline."""
+    st = _normalize_status(status)
+    if not device_id or device_id == "__unknown__":
+        return
+    if device_id != TELEGRAM_PARKING_DEVICE_ID:
+        return
+    if st not in ("online", "offline"):
+        return
+    text = f"{TELEGRAM_PARKING_DEVICE_NAME} ({device_id}) - deviceStatus: {st}"
+    res = telegram_send_message(text)
+    if not res.get("ok"):
+        # keep quiet, but log to app logger
+        app.logger.warning(f"Telegram send failed: {res}")
+
 
 # -----------------------------
 # DB helpers (SQLite)
@@ -207,6 +273,14 @@ def get_device_name(device_id: str) -> str:
     if not row:
         return ""
     return (row["device_name"] or "").strip()
+
+
+def get_device_status(device_id: str) -> str:
+    conn = db_connect()
+    row = conn.execute("SELECT status FROM devices WHERE device_id=?", (device_id,)).fetchone()
+    conn.close()
+    return "" if not row else (row["status"] or "")
+
 
 
 def add_event(device_id: str, msg_type: str, summary: str, occur_time: str, raw: dict):
@@ -811,6 +885,16 @@ def admin_flush_sheets():
     return jsonify(res)
 
 
+@app.post("/admin/test-telegram")
+def admin_test_telegram():
+    require_admin()
+    body = request.get_json(silent=True) or {}
+    text = (body.get("text") or f"{TELEGRAM_PARKING_DEVICE_NAME} ({TELEGRAM_PARKING_DEVICE_ID}) - deviceStatus: online").strip()
+    res = telegram_send_message(text)
+    return jsonify(res)
+
+
+
 @app.post("/admin/clear-sheets-queue")
 def admin_clear_sheets_queue():
     require_admin()
@@ -1079,7 +1163,7 @@ def imou_callback():
                 status = msg_type
                 summary = f"deviceStatus: {status}"
             elif msg_type == "deviceStatus":
-                status = (msg.get("status") or "").strip().lower()
+                status = _normalize_status(msg.get("status") or "")
                 summary = f"deviceStatus: {status or 'unknown'}"
             elif msg_type == "alarm":
                 summary = f"alarm: {(msg.get('alarmName') or '')} {(msg.get('alarmType') or '')}".strip()
@@ -1087,7 +1171,18 @@ def imou_callback():
                 summary = msg_type
 
             add_event(device_id, msg_type, summary, occur_time, msg)
-            upsert_device(device_id, status=status, last_seen_utc=now_kyiv_iso(), last_event_summary=summary)
+            # Telegram notify on status changes (for parking device only)
+            if status in ("online", "offline"):
+                prev = get_device_status(device_id)
+                if prev != status:
+                    maybe_notify_telegram_device_status(device_id, status)
+
+            fields = {"last_seen_utc": now_kyiv_iso(), "last_event_summary": summary}
+            if status:
+                fields["status"] = status
+            upsert_device(device_id, **fields)
+
+
 
     except Exception:
         app.logger.exception("IMOU CALLBACK processing error")

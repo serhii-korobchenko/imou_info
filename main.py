@@ -6,6 +6,7 @@ import hashlib
 import sqlite3
 import base64
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, request, jsonify, abort, render_template_string
@@ -27,8 +28,15 @@ def env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+def now_kyiv_iso() -> str:
+    # ISO 8601 with correct +02:00/+03:00 depending on DST
+    return datetime.now(KYIV_TZ).replace(microsecond=0).isoformat()
+
 def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    # Keep UTC helper in case you need it elsewhere
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def sha256_hex(s: str) -> str:
@@ -177,7 +185,7 @@ def upsert_device(device_id: str, **fields):
         keys.append(k)
         vals.append(v)
     keys.append("updated_at_utc")
-    vals.append(now_utc_iso())
+    vals.append(now_kyiv_iso())
 
     conn = db_connect()
     existing = conn.execute("SELECT device_id FROM devices WHERE device_id=?", (device_id,)).fetchone()
@@ -207,7 +215,7 @@ def add_event(device_id: str, msg_type: str, summary: str, occur_time: str, raw:
     2) Store in sheet_queue (keeps ALL events)
     3) Try flush to Google Sheets (best-effort)
     """
-    received_at = now_utc_iso()
+    received_at = now_kyiv_iso()
     raw_json = json.dumps(raw, ensure_ascii=False)
 
     # ---- (A) SQLite events (keeps only last 5000) ----
@@ -286,7 +294,7 @@ def save_callback_inbox(headers: dict, body_text: str):
     conn = db_connect()
     conn.execute(
         "INSERT INTO callback_inbox(received_at_utc, headers_json, body_text) VALUES(?,?,?)",
-        (now_utc_iso(), json.dumps(headers, ensure_ascii=False), body_text),
+        (now_kyiv_iso(), json.dumps(headers, ensure_ascii=False), body_text),
     )
     conn.execute(
         f"DELETE FROM callback_inbox WHERE id NOT IN (SELECT id FROM callback_inbox ORDER BY id DESC LIMIT {int(CALLBACK_INBOX_MAX)})"
@@ -449,7 +457,7 @@ def ensure_tab_and_header():
 
     # Write header row A1:G1
     header = [
-        "received_at_utc",
+        "received_at_kyiv",
         "occur_time",
         "device_id",
         "device_name",
@@ -498,7 +506,7 @@ def enqueue_event_for_sheets(
         INSERT OR IGNORE INTO sheet_queue(uid,row_json,created_at_utc,sent,sent_at_utc)
         VALUES(?,?,?,0,NULL)
         """,
-        (uid, json.dumps(row, ensure_ascii=False), now_utc_iso()),
+        (uid, json.dumps(row, ensure_ascii=False), now_kyiv_iso()),
     )
     conn.commit()
     conn.close()
@@ -564,7 +572,7 @@ def flush_sheets(max_rows: int | None = None) -> dict:
 
         # Mark sent
         conn = db_connect()
-        now_sent = now_utc_iso()
+        now_sent = now_kyiv_iso()
         conn.executemany(
             "UPDATE sheet_queue SET sent=1, sent_at_utc=? WHERE uid=?",
             [(now_sent, uid) for uid in uids],
@@ -895,7 +903,7 @@ def index():
         <th>Name</th>
         <th>Device ID</th>
         <th>Status</th>
-        <th>Last seen (UTC)</th>
+        <th>Last seen (Kyiv)</th>
         <th>Last event</th>
       </tr>
     </thead>
@@ -923,7 +931,7 @@ def index():
         <th>Type</th>
         <th>Summary</th>
         <th>Occur time</th>
-        <th>Received (UTC)</th>
+        <th>Received (Kyiv)</th>
       </tr>
     </thead>
     <tbody id="eventrows">
@@ -1079,7 +1087,7 @@ def imou_callback():
                 summary = msg_type
 
             add_event(device_id, msg_type, summary, occur_time, msg)
-            upsert_device(device_id, status=status, last_seen_utc=now_utc_iso(), last_event_summary=summary)
+            upsert_device(device_id, status=status, last_seen_utc=now_kyiv_iso(), last_event_summary=summary)
 
     except Exception:
         app.logger.exception("IMOU CALLBACK processing error")
@@ -1129,7 +1137,7 @@ def admin_sync():
             device_name=device_name,
             status=device_status,
             channel_status_json=json.dumps(channel_status, ensure_ascii=False),
-            last_seen_utc=now_utc_iso(),
+            last_seen_utc=now_kyiv_iso(),
         )
 
         try:

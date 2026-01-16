@@ -152,8 +152,16 @@ def maybe_notify_telegram_device_status(device_id: str, status: str):
         return
     if st not in ("online", "offline"):
         return
-    text = f"{TELEGRAM_PARKING_DEVICE_NAME} ({device_id}) - deviceStatus: {st}"
-    res = telegram_send_message(text)
+    if st in ("online"):
+        text = "ДАЛИ СВІТЛО"
+        res = telegram_send_message(text)
+    else:
+        text = "ВІДКЛЮЧИЛИ СВІТЛО"
+        res = telegram_send_message(text)
+    
+    # text = f"{TELEGRAM_PARKING_DEVICE_NAME} ({device_id}) - deviceStatus: {st}"
+    # res = telegram_send_message(text)
+    
     if not res.get("ok"):
         # keep quiet, but log to app logger
         app.logger.warning(f"Telegram send failed: {res}")

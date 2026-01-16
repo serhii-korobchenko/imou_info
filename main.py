@@ -43,6 +43,49 @@ def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+
+def _parse_iso_dt(s: str):
+    """Parse ISO8601 string to datetime (aware if offset present). Returns None on failure."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _format_hhmm(total_seconds: int) -> str:
+    """Formats seconds as '<H> год <MM> хв'. Always includes hours and minutes."""
+    total_seconds = max(0, int(total_seconds or 0))
+    minutes = total_seconds // 60
+    h = minutes // 60
+    m = minutes % 60
+    return f"{h} год {m:02d} хв"
+
+
+def _build_power_interval_note(new_status: str, prev_changed_at_iso: str, now_iso: str) -> str:
+    """
+    new_status: 'online' or 'offline'
+    prev_changed_at_iso: when the previous status started (Kyiv ISO string)
+    now_iso: current time (Kyiv ISO string)
+
+    Returns a Ukrainian note, e.g. 'Було без світла: 1 год 23 хв'
+    """
+    dt0 = _parse_iso_dt(prev_changed_at_iso)
+    dt1 = _parse_iso_dt(now_iso)
+    if not dt0 or not dt1:
+        return ""
+    delta = int((dt1 - dt0).total_seconds())
+    if delta < 0:
+        return ""
+
+    # If we are going ONLINE now, we were OFFLINE before -> "without power" interval.
+    # If we are going OFFLINE now, we were ONLINE before -> "with power" interval.
+    label = "Було без світла" if new_status == "online" else "Було зі світлом"
+    return f"{label}: {_format_hhmm(delta)}"
+
+
 # -----------------------------
 # Config (Railway env vars)
 # -----------------------------
@@ -143,7 +186,7 @@ def telegram_send_message(text: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def maybe_notify_telegram_device_status(device_id: str, status: str):
+def maybe_notify_telegram_device_status(device_id: str, status: str, interval_note: str = ""):
     """Sends ONLY for the configured parking device, and only for online/offline."""
     st = _normalize_status(status)
     if not device_id or device_id == "__unknown__":
@@ -152,16 +195,15 @@ def maybe_notify_telegram_device_status(device_id: str, status: str):
         return
     if st not in ("online", "offline"):
         return
-    if st in ("online"):
-        text = "ДАЛИ СВІТЛО"
-        res = telegram_send_message(text)
-    else:
-        text = "ВІДКЛЮЧИЛИ СВІТЛО"
-        res = telegram_send_message(text)
-    
-    # text = f"{TELEGRAM_PARKING_DEVICE_NAME} ({device_id}) - deviceStatus: {st}"
-    # res = telegram_send_message(text)
-    
+
+    base = "ДАЛИ СВІТЛО" if st == "online" else "ВІДКЛЮЧИЛИ СВІТЛО"
+
+    text = base
+    if interval_note:
+        text = f"{base}\n{interval_note}"
+
+    res = telegram_send_message(text)
+
     if not res.get("ok"):
         # keep quiet, but log to app logger
         app.logger.warning(f"Telegram send failed: {res}")
@@ -196,6 +238,7 @@ def db_init():
             channel_status_json TEXT,
             last_seen_utc TEXT,
             last_event_summary TEXT,
+            status_changed_at_kyiv TEXT,
             updated_at_utc TEXT
         );
 
@@ -232,7 +275,20 @@ def db_init():
     conn.close()
 
 
+def db_migrate():
+    """Lightweight DB migration to keep existing deployments working."""
+    conn = db_connect()
+    try:
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(devices)").fetchall()]
+        if "status_changed_at_kyiv" not in cols:
+            conn.execute("ALTER TABLE devices ADD COLUMN status_changed_at_kyiv TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 db_init()
+db_migrate()
 
 
 def kv_get(key: str):
@@ -288,6 +344,20 @@ def get_device_status(device_id: str) -> str:
     row = conn.execute("SELECT status FROM devices WHERE device_id=?", (device_id,)).fetchone()
     conn.close()
     return "" if not row else (row["status"] or "")
+
+
+
+def get_device_status_info(device_id: str) -> tuple[str, str]:
+    """Returns (status, status_changed_at_kyiv). Empty strings if missing."""
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT status, COALESCE(status_changed_at_kyiv, '') AS status_changed_at_kyiv FROM devices WHERE device_id=?",
+        (device_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return "", ""
+    return (row["status"] or ""), (row["status_changed_at_kyiv"] or "")
 
 
 
@@ -517,9 +587,13 @@ def ensure_events_spreadsheet_id() -> str:
 
 
 def ensure_tab_and_header():
-    """
-    Ensures sheet tab exists and first row is header.
-    Uses kv flag to avoid repeating.
+    """    Ensures sheet tab exists.
+
+    IMPORTANT for backward compatibility:
+    - If the sheet already has a header row (any non-empty cell in A1:Z1), we DO NOT overwrite it.
+    - We only write our default header when the first row is empty.
+
+    This lets you keep your existing Google Sheet (old columns, formulas, filters) and continue appending rows.
     """
     sid = ensure_events_spreadsheet_id()
     sheets = get_sheets_service()
@@ -528,7 +602,7 @@ def ensure_tab_and_header():
     if header_done == "1":
         return
 
-    # Check existing tabs
+    # Ensure tab exists
     meta = sheets.spreadsheets().get(spreadsheetId=sid).execute()
     tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
     if GDRIVE_EVENTS_TAB_NAME not in tabs:
@@ -537,22 +611,33 @@ def ensure_tab_and_header():
             body={"requests": [{"addSheet": {"properties": {"title": GDRIVE_EVENTS_TAB_NAME}}}]},
         ).execute()
 
-    # Write header row A1:G1
-    header = [
-        "received_at_kyiv",
-        "occur_time",
-        "device_id",
-        "device_name",
-        "msg_type",
-        "summary",
-        "raw_json",
-    ]
-    sheets.spreadsheets().values().update(
-        spreadsheetId=sid,
-        range=f"{GDRIVE_EVENTS_TAB_NAME}!A1:G1",
-        valueInputOption="RAW",
-        body={"values": [header]},
-    ).execute()
+    # Check if header already exists (do not overwrite)
+    try:
+        r = sheets.spreadsheets().values().get(
+            spreadsheetId=sid,
+            range=f"{GDRIVE_EVENTS_TAB_NAME}!A1:Z1",
+        ).execute()
+        existing = (r.get("values") or [[]])[0] if r.get("values") else []
+    except Exception:
+        existing = []
+
+    has_header = any(str(c).strip() for c in (existing or []))
+    if not has_header:
+        header = [
+            "received_at_kyiv",
+            "occur_time",
+            "device_id",
+            "device_name",
+            "msg_type",
+            "summary",
+            "raw_json",
+        ]
+        sheets.spreadsheets().values().update(
+            spreadsheetId=sid,
+            range=f"{GDRIVE_EVENTS_TAB_NAME}!A1:G1",
+            valueInputOption="RAW",
+            body={"values": [header]},
+        ).execute()
 
     kv_set("gsheet_events_header_done", "1")
 
@@ -1166,7 +1251,13 @@ def imou_callback():
             msg_type = (msg.get("msgType") or msg.get("type") or "unknown").strip()
             occur_time = str(msg.get("occurTime") or msg.get("time") or "")
 
+            now_iso = now_kyiv_iso()
+
             status = ""
+            interval_note = ""
+            prev_status = ""
+            prev_changed_at = ""
+
             if msg_type in ("online", "offline"):
                 status = msg_type
                 summary = f"deviceStatus: {status}"
@@ -1178,16 +1269,33 @@ def imou_callback():
             else:
                 summary = msg_type
 
-            add_event(device_id, msg_type, summary, occur_time, msg)
-            # Telegram notify on status changes (for parking device only)
-            if status in ("online", "offline"):
-                prev = get_device_status(device_id)
-                if prev != status:
-                    maybe_notify_telegram_device_status(device_id, status)
+            # Build power interval note ONLY for real online/offline transitions.
+            if status in ("online", "offline") and device_id and device_id != "__unknown__":
+                prev_status, prev_changed_at = get_device_status_info(device_id)
+                if prev_status in ("online", "offline") and prev_changed_at and prev_status != status:
+                    interval_note = _build_power_interval_note(status, prev_changed_at, now_iso)
+                    if interval_note:
+                        # Keep Google Sheets schema unchanged: duration is embedded into the same 'summary' cell.
+                        summary = f"{summary} ({interval_note})"
 
-            fields = {"last_seen_utc": now_kyiv_iso(), "last_event_summary": summary}
+            add_event(device_id, msg_type, summary, occur_time, msg)
+
+            # Telegram notify on status changes (for parking device only)
+            if status in ("online", "offline") and prev_status != status:
+                maybe_notify_telegram_device_status(device_id, status, interval_note)
+
+            fields = {"last_seen_utc": now_iso, "last_event_summary": summary}
             if status:
                 fields["status"] = status
+
+            # Track when the current ONLINE/OFFLINE status started (used for power on/off interval calculation)
+            if status in ("online", "offline"):
+                if not prev_changed_at:
+                    # baseline if missing
+                    fields["status_changed_at_kyiv"] = now_iso
+                elif prev_status != status:
+                    fields["status_changed_at_kyiv"] = now_iso
+
             upsert_device(device_id, **fields)
 
 

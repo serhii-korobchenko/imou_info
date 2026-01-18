@@ -5,6 +5,7 @@ import uuid
 import hashlib
 import sqlite3
 import base64
+import math
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -1030,6 +1031,9 @@ def index():
 </head>
 <body>
   <h2>Imou Cameras Status</h2>
+  <div class="muted" style="margin-top:-8px; margin-bottom:12px;">
+    <a href="/charts">Charts</a>
+  </div>
 
   <div class="row">
     <div class="card">
@@ -1304,6 +1308,319 @@ def imou_callback():
         app.logger.exception("IMOU CALLBACK processing error")
 
     return "OK", 200
+
+
+
+
+# -----------------------------
+# Charts (web dashboard)
+# -----------------------------
+_CHARTS_CACHE = {}
+CHARTS_CACHE_TTL_SEC = int(os.getenv("CHARTS_CACHE_TTL_SEC", "300"))
+CHARTS_SMOOTH_SIGMA = float(os.getenv("CHARTS_SMOOTH_SIGMA", "2.0"))
+
+
+def _charts_cache_get(key: str):
+    hit = _CHARTS_CACHE.get(key)
+    if not hit:
+        return None
+    if time.time() - hit.get("ts", 0) > CHARTS_CACHE_TTL_SEC:
+        return None
+    return hit.get("val")
+
+
+def _charts_cache_set(key: str, val):
+    _CHARTS_CACHE[key] = {"ts": time.time(), "val": val}
+
+
+def _gaussian_smooth_60(counts, sigma: float = 2.0):
+    """Gaussian smoothing for 60 bins. Returns list[float] length 60."""
+    counts = list(counts or [])
+    if len(counts) != 60:
+        counts = (counts + [0]*60)[:60]
+
+    sigma = float(sigma or 0.0)
+    if sigma <= 0:
+        return [float(x) for x in counts]
+
+    radius = int(max(3, math.ceil(sigma * 3)))
+    kernel = [math.exp(-(x*x) / (2*sigma*sigma)) for x in range(-radius, radius + 1)]
+    s = sum(kernel) or 1.0
+    kernel = [k / s for k in kernel]
+
+    out = [0.0] * 60
+    for i in range(60):
+        v = 0.0
+        for j, k in enumerate(kernel):
+            idx = i + (j - radius)
+            if 0 <= idx < 60:
+                v += counts[idx] * k
+        out[i] = v
+    return out
+
+
+def _safe_fromiso_minute(ts: str):
+    """Parse ISO timestamp and return minute (0..59) or None."""
+    dt = _parse_iso_dt(ts)
+    if not dt:
+        return None
+    try:
+        return int(dt.minute)
+    except Exception:
+        return None
+
+
+def compute_minute_hist_from_gsheets(device_id: str, msg_type: str):
+    """Reads Events sheet and computes minute histogram (0..59) for device_id + msg_type."""
+    # Requires google creds
+    if not google_enabled():
+        return {
+            "ok": False,
+            "error": "Google is disabled (missing GDRIVE_SA_JSON_B64)",
+            "minutes": list(range(60)),
+            "counts": [0] * 60,
+            "smoothed": [0] * 60,
+            "total": 0,
+            "source": "gsheets",
+        }
+
+    try:
+        sid = ensure_events_spreadsheet_id()
+        sheets = get_sheets_service()
+
+        # Read only first 5 columns (A:E) - enough for default layout and efficient for large sheets
+        rng = f"{GDRIVE_EVENTS_TAB_NAME}!A:E"
+        values = sheets.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get("values", [])
+
+        if not values or len(values) < 2:
+            return {
+                "ok": True,
+                "device_id": device_id,
+                "msg_type": msg_type,
+                "minutes": list(range(60)),
+                "counts": [0] * 60,
+                "smoothed": [0] * 60,
+                "total": 0,
+                "source": "gsheets",
+            }
+
+        header = values[0]
+
+        # Default indices for our standard header/order:
+        # A received_at_kyiv, B occur_time, C device_id, D device_name, E msg_type
+        i_time, i_dev, i_type = 0, 2, 4
+
+        # If header names exist, try to map by name (to be more robust)
+        try:
+            if isinstance(header, list) and header:
+                if "received_at_kyiv" in header:
+                    i_time = header.index("received_at_kyiv")
+                elif "received_at_utc" in header:
+                    i_time = header.index("received_at_utc")
+                if "device_id" in header:
+                    i_dev = header.index("device_id")
+                if "msg_type" in header:
+                    i_type = header.index("msg_type")
+        except Exception:
+            pass
+
+        counts = [0] * 60
+        total = 0
+
+        for row in values[1:]:
+            if not row:
+                continue
+            if len(row) <= max(i_time, i_dev, i_type):
+                continue
+            if (row[i_dev] or "").strip() != (device_id or "").strip():
+                continue
+            if (row[i_type] or "").strip() != (msg_type or "").strip():
+                continue
+
+            minute = _safe_fromiso_minute(row[i_time])
+            if minute is None:
+                continue
+            if 0 <= minute <= 59:
+                counts[minute] += 1
+                total += 1
+
+        smoothed = _gaussian_smooth_60(counts, sigma=CHARTS_SMOOTH_SIGMA)
+
+        return {
+            "ok": True,
+            "device_id": device_id,
+            "msg_type": msg_type,
+            "minutes": list(range(60)),
+            "counts": counts,
+            "smoothed": smoothed,
+            "total": total,
+            "source": "gsheets",
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "device_id": device_id,
+            "msg_type": msg_type,
+            "minutes": list(range(60)),
+            "counts": [0] * 60,
+            "smoothed": [0] * 60,
+            "total": 0,
+            "source": "gsheets",
+        }
+
+
+@app.get("/api/charts/minute-hist")
+def api_charts_minute_hist():
+    device_id = (request.args.get("device_id") or (TELEGRAM_PARKING_DEVICE_ID or "")).strip()
+    msg_type = (request.args.get("msg_type") or "offline").strip()
+
+    # Basic safety
+    if msg_type not in ("offline", "online"):
+        msg_type = "offline"
+
+    cache_key = f"minute_hist:{device_id}:{msg_type}"
+    cached = _charts_cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    data = compute_minute_hist_from_gsheets(device_id, msg_type)
+    _charts_cache_set(cache_key, data)
+    return jsonify(data)
+
+
+@app.get("/charts")
+def charts_page():
+    devices = get_devices()
+    default_device = (TELEGRAM_PARKING_DEVICE_ID or (devices[0]["device_id"] if devices else "")).strip()
+
+    return render_template_string(
+        """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Charts</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 20px; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:end; }
+    label { font-size: 12px; color: #666; }
+    select, button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ddd; background: #fff; }
+    button { cursor:pointer; }
+    button:hover { background:#fafafa; }
+    .muted { color:#666; font-size: 12px; }
+    a { color: #0b57d0; }
+  </style>
+</head>
+<body>
+
+  <div class="topbar">
+    <div>
+      <h2 style="margin:0;">Charts</h2>
+      <div class="muted" style="margin-top:6px;">
+        <a href="/">Home</a>
+      </div>
+    </div>
+    <div class="muted">Source: Google Sheets → Events</div>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <div class="row">
+      <div>
+        <label>Device</label><br/>
+        <select id="device">
+          {% for d in devices %}
+            <option value="{{ d.device_id }}" {% if d.device_id == default_device %}selected{% endif %}>
+              {{ (d.device_name or 'Device') }} ({{ d.device_id }})
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label>Event type</label><br/>
+        <select id="msg_type">
+          <option value="offline" selected>offline</option>
+          <option value="online">online</option>
+        </select>
+      </div>
+
+      <div>
+        <button onclick="reloadChart()">Refresh</button>
+      </div>
+
+      <div class="muted" id="meta" style="padding-bottom:6px;"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <canvas id="chart" height="120"></canvas>
+  </div>
+
+<script>
+let chartObj = null;
+
+async function reloadChart(){
+  const device = document.getElementById('device').value;
+  const msgType = document.getElementById('msg_type').value;
+
+  const metaEl = document.getElementById('meta');
+  metaEl.textContent = 'Loading...';
+
+  const res = await fetch(`/api/charts/minute-hist?device_id=${encodeURIComponent(device)}&msg_type=${encodeURIComponent(msgType)}`);
+  const data = await res.json();
+
+  if (!data.ok){
+    metaEl.textContent = 'Error: ' + (data.error || 'unknown');
+    return;
+  }
+
+  metaEl.textContent = `Total events: ${data.total} (source: ${data.source || 'unknown'})`;
+
+  const labels = data.minutes.map(m => String(m).padStart(2,'0'));
+  const counts = data.counts;
+  const smoothed = data.smoothed;
+
+  const ctx = document.getElementById('chart').getContext('2d');
+  if (chartObj) chartObj.destroy();
+
+  chartObj = new Chart(ctx, {
+    data: {
+      labels: labels,
+      datasets: [
+        { type: 'bar', label: `Count (${data.msg_type})`, data: counts },
+        { type: 'line', label: 'Smoothed', data: smoothed, tension: 0.35, pointRadius: 0 }
+      ]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        title: { display: true, text: `Distribution of Minutes (${data.msg_type}) — ${data.device_id}` },
+        tooltip: { mode: 'index', intersect: false }
+      },
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        y: { beginAtZero: true, title: { display: true, text: 'Frequency' } },
+        x: { title: { display: true, text: 'Minute of the hour' } }
+      }
+    }
+  });
+}
+
+reloadChart();
+</script>
+
+</body>
+</html>
+        """,
+        devices=devices,
+        default_device=default_device,
+    )
 
 
 # -----------------------------

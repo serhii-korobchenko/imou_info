@@ -195,8 +195,8 @@ def maybe_notify_telegram_device_status(device_id: str, status: str, interval_no
         return
     if st not in ("online", "offline"):
         return
-
-    base = "ДАЛИ СВІТЛО" if st == "online" else "ВІДКЛЮЧИЛИ СВІТЛО"
+    emoji = '🟢' if st == 'online' else '🔴'
+    base = f"{emoji} ДАЛИ СВІТЛО" if st == 'online' else f"{emoji} ВІДКЛЮЧИЛИ СВІТЛО"
 
     text = base
     if interval_note:

@@ -6,7 +6,7 @@ import hashlib
 import sqlite3
 import base64
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -1711,6 +1711,180 @@ def api_charts_power_ratio():
     _charts_cache_set(cache_key, data)
     return jsonify(data)
 
+
+# -----------------------------
+# Charts: Daily power ratio (Parking)
+# -----------------------------
+def _accumulate_daily(bucket: dict, start_dt: datetime, end_dt: datetime, st: str):
+    """Accumulate seconds for status st between [start_dt, end_dt) into bucket by Kyiv date."""
+    if not start_dt or not end_dt:
+        return
+    start_dt = _dt_ensure_tz(start_dt).astimezone(KYIV_TZ)
+    end_dt = _dt_ensure_tz(end_dt).astimezone(KYIV_TZ)
+    if end_dt <= start_dt:
+        return
+
+    cur = start_dt
+    # split by midnight boundaries in Kyiv
+    while cur.date() < end_dt.date():
+        nxt_midnight = datetime(cur.year, cur.month, cur.day, tzinfo=KYIV_TZ) + timedelta(days=1)
+        sec = int((nxt_midnight - cur).total_seconds())
+        if sec > 0:
+            key = cur.date().isoformat()
+            b = bucket.setdefault(key, {'online_sec': 0, 'offline_sec': 0})
+            if st == 'online':
+                b['online_sec'] += sec
+            elif st == 'offline':
+                b['offline_sec'] += sec
+        cur = nxt_midnight
+
+    sec = int((end_dt - cur).total_seconds())
+    if sec > 0:
+        key = cur.date().isoformat()
+        b = bucket.setdefault(key, {'online_sec': 0, 'offline_sec': 0})
+        if st == 'online':
+            b['online_sec'] += sec
+        elif st == 'offline':
+            b['offline_sec'] += sec
+
+
+def compute_power_ratio_daily_parking_from_gsheets():
+    """Daily ONLINE vs OFFLINE hours by date for the Parking device (Kyiv dates), based on Events sheet."""
+    device_id = (TELEGRAM_PARKING_DEVICE_ID or '').strip()
+    device_name = (TELEGRAM_PARKING_DEVICE_NAME or 'Парковка').strip()
+
+    if not google_enabled():
+        return {
+            'ok': False,
+            'error': 'Google is disabled (missing GDRIVE_SA_JSON_B64)',
+            'device_id': device_id,
+            'device_name': device_name,
+            'dates': [],
+            'online_hours': [],
+            'offline_hours': [],
+            'offline_pct': [],
+            'range_from': None,
+            'range_to': None,
+            'source': 'gsheets',
+        }
+
+    try:
+        sid = ensure_events_spreadsheet_id()
+        sheets = get_sheets_service()
+
+        rng = f"{GDRIVE_EVENTS_TAB_NAME}!A:E"
+        values = sheets.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get('values', [])
+        if not values or len(values) < 2:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'dates': [],
+                'online_hours': [],
+                'offline_hours': [],
+                'offline_pct': [],
+                'range_from': None,
+                'range_to': None,
+                'source': 'gsheets',
+            }
+
+        header = values[0]
+        i_time, i_dev, i_type = 0, 2, 4
+        try:
+            if isinstance(header, list) and header:
+                if 'received_at_kyiv' in header:
+                    i_time = header.index('received_at_kyiv')
+                elif 'received_at_utc' in header:
+                    i_time = header.index('received_at_utc')
+                if 'device_id' in header:
+                    i_dev = header.index('device_id')
+                if 'msg_type' in header:
+                    i_type = header.index('msg_type')
+        except Exception:
+            pass
+
+        events = _extract_status_events(values, device_id=device_id, i_time=i_time, i_dev=i_dev, i_type=i_type)
+        if not events:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'dates': [],
+                'online_hours': [],
+                'offline_hours': [],
+                'offline_pct': [],
+                'range_from': None,
+                'range_to': None,
+                'source': 'gsheets',
+            }
+
+        bucket = {}
+        last_dt, last_st = events[0]
+        last_dt = _dt_ensure_tz(last_dt).astimezone(KYIV_TZ)
+        range_from = last_dt
+
+        for dt, st in events[1:]:
+            dt = _dt_ensure_tz(dt).astimezone(KYIV_TZ)
+            _accumulate_daily(bucket, last_dt, dt, last_st)
+            last_dt, last_st = dt, st
+
+        now_dt = datetime.now(KYIV_TZ)
+        _accumulate_daily(bucket, last_dt, now_dt, last_st)
+
+        dates = sorted(bucket.keys())
+        online_hours = []
+        offline_hours = []
+        offline_pct = []
+        for d in dates:
+            on = bucket[d]['online_sec']
+            off = bucket[d]['offline_sec']
+            total = on + off
+            online_hours.append(round(on / 3600.0, 2))
+            offline_hours.append(round(off / 3600.0, 2))
+            pct = (off / total * 100.0) if total > 0 else 0.0
+            offline_pct.append(round(pct, 2))
+
+        return {
+            'ok': True,
+            'device_id': device_id,
+            'device_name': device_name,
+            'dates': dates,
+            'online_hours': online_hours,
+            'offline_hours': offline_hours,
+            'offline_pct': offline_pct,
+            'range_from': range_from.isoformat() if range_from else None,
+            'range_to': now_dt.isoformat(),
+            'source': 'gsheets',
+        }
+
+    except Exception as e:
+        return {
+            'ok': False,
+            'error': str(e),
+            'device_id': device_id,
+            'device_name': device_name,
+            'dates': [],
+            'online_hours': [],
+            'offline_hours': [],
+            'offline_pct': [],
+            'range_from': None,
+            'range_to': None,
+            'source': 'gsheets',
+        }
+
+
+@app.get('/api/charts/power-daily')
+def api_charts_power_daily():
+    cache_key = f"power_daily:{TELEGRAM_PARKING_DEVICE_ID or ''}"
+    cached = _charts_cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    data = compute_power_ratio_daily_parking_from_gsheets()
+    _charts_cache_set(cache_key, data)
+    return jsonify(data)
+
+
 @app.get("/charts")
 def charts_page():
     devices = get_devices()
@@ -1788,9 +1962,15 @@ def charts_page():
     <canvas id="ratioChart" height="120"></canvas>
   </div>
 
+  <div class="card" style="margin-top:14px;">
+    <div class="muted" id="daily_meta" style="margin-bottom:8px;"></div>
+    <canvas id="dailyChart" height="140"></canvas>
+  </div>
+
 <script>
 let chartObj = null;
 let ratioObj = null;
+let dailyObj = null;
 
 async function reloadChart(){
   const device = document.getElementById('device').value;
@@ -1875,9 +2055,68 @@ async function reloadRatio(){
   });
 }
 
+
+async function reloadDaily(){
+  const metaEl = document.getElementById('daily_meta');
+  metaEl.textContent = 'Loading daily...';
+
+  const res = await fetch('/api/charts/power-daily');
+  const data = await res.json();
+
+  if (!data.ok){
+    metaEl.textContent = 'Error: ' + (data.error || 'unknown');
+    return;
+  }
+
+  const n = (data.dates || []).length;
+  metaEl.textContent = `${data.device_name} (${data.device_id}) | days: ${n} | from ${data.range_from || '-'} to ${data.range_to || '-'}`;
+
+  const ctx = document.getElementById('dailyChart').getContext('2d');
+  if (dailyObj) dailyObj.destroy();
+
+  dailyObj = new Chart(ctx, {
+    data: {
+      labels: data.dates,
+      datasets: [
+        { type: 'bar', label: 'Light ON (hours)', data: data.online_hours, stack: 'hours', backgroundColor: 'rgba(0, 200, 83, 0.55)' },
+        { type: 'bar', label: 'Light OFF (hours)', data: data.offline_hours, stack: 'hours', backgroundColor: 'rgba(244, 67, 54, 0.55)' },
+        { type: 'line', label: 'OFF (%)', data: data.offline_pct, yAxisID: 'y1', tension: 0.35, pointRadius: 0, borderColor: 'rgba(244, 67, 54, 0.9)' }
+      ]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        title: { display: true, text: 'Power availability by date (Parking)' },
+        tooltip: { mode: 'index', intersect: false }
+      },
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: {
+          stacked: true,
+          ticks: { autoSkip: true, maxTicksLimit: 14, maxRotation: 0 }
+        },
+        y: {
+          stacked: true,
+          beginAtZero: true,
+          title: { display: true, text: 'Hours' }
+        },
+        y1: {
+          beginAtZero: true,
+          min: 0,
+          max: 100,
+          position: 'right',
+          grid: { drawOnChartArea: false },
+          title: { display: true, text: 'OFF (%)' }
+        }
+      }
+    }
+  });
+}
+
 function refreshAll(){
   reloadChart();
   reloadRatio();
+  reloadDaily();
 }
 
 refreshAll();

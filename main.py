@@ -1318,6 +1318,7 @@ def imou_callback():
 _CHARTS_CACHE = {}
 CHARTS_CACHE_TTL_SEC = int(os.getenv("CHARTS_CACHE_TTL_SEC", "300"))
 CHARTS_SMOOTH_SIGMA = float(os.getenv("CHARTS_SMOOTH_SIGMA", "2.0"))
+CHARTS_MIN_OUTAGE_MINUTES = int(os.getenv("CHARTS_MIN_OUTAGE_MINUTES", "10"))  # ignore outages shorter than this on charts
 
 
 def _charts_cache_get(key: str):
@@ -1370,38 +1371,110 @@ def _safe_fromiso_minute(ts: str):
         return None
 
 
+
+
+def _dt_ensure_tz(dt: datetime) -> datetime:
+    """Ensure datetime is timezone-aware. If naive, assume Kyiv."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=KYIV_TZ)
+    return dt
+
+
+def _extract_status_events(values, device_id: str, i_time: int, i_dev: int, i_type: int):
+    """Return sorted list of (dt, status) for a given device from sheet rows."""
+    out = []
+    did = (device_id or '').strip()
+    for row in values[1:]:
+        if not row or len(row) <= max(i_time, i_dev, i_type):
+            continue
+        if (row[i_dev] or '').strip() != did:
+            continue
+        st = (row[i_type] or '').strip()
+        if st not in ('online','offline'):
+            continue
+        dt = _parse_iso_dt(row[i_time])
+        if not dt:
+            continue
+        dt = _dt_ensure_tz(dt)
+        out.append((dt, st))
+    out.sort(key=lambda x: x[0])
+
+    # Collapse consecutive duplicates (online-online, offline-offline)
+    collapsed = []
+    last_st = None
+    for dt, st in out:
+        if st == last_st:
+            continue
+        collapsed.append((dt, st))
+        last_st = st
+    return collapsed
+
+
+def _compute_outages_from_status_events(events):
+    """From status-change events (dt, status), compute list of outages as (start_dt, end_dt or None)."""
+    outages = []
+    cur_off_start = None
+
+    for dt, st in events:
+        if st == 'offline':
+            # start of outage
+            cur_off_start = dt
+        elif st == 'online':
+            if cur_off_start is not None:
+                outages.append((cur_off_start, dt))
+                cur_off_start = None
+
+    # ongoing outage
+    if cur_off_start is not None:
+        outages.append((cur_off_start, None))
+
+    return outages
+
+
 def compute_minute_hist_from_gsheets(device_id: str, msg_type: str):
-    """Reads Events sheet and computes minute histogram (0..59) for device_id + msg_type."""
-    # Requires google creds
+    """Reads Events sheet and computes minute histogram for device_id + msg_type.
+
+    IMPORTANT: For power charts we ignore short outages (< CHARTS_MIN_OUTAGE_MINUTES).
+    - If msg_type == 'offline': histogram of outage START minutes, for outages >= threshold.
+    - If msg_type == 'online' : histogram of outage END minutes (power restored), for outages >= threshold.
+
+    This logic affects ONLY charts; Telegram notifications & DB logic are unchanged.
+    """
     if not google_enabled():
         return {
-            "ok": False,
-            "error": "Google is disabled (missing GDRIVE_SA_JSON_B64)",
-            "minutes": list(range(60)),
-            "counts": [0] * 60,
-            "smoothed": [0] * 60,
-            "total": 0,
-            "source": "gsheets",
+            'ok': False,
+            'error': 'Google is disabled (missing GDRIVE_SA_JSON_B64)',
+            'device_id': device_id,
+            'msg_type': msg_type,
+            'minutes': list(range(60)),
+            'counts': [0] * 60,
+            'smoothed': [0] * 60,
+            'total': 0,
+            'source': 'gsheets',
+            'min_outage_minutes': CHARTS_MIN_OUTAGE_MINUTES,
         }
 
     try:
         sid = ensure_events_spreadsheet_id()
         sheets = get_sheets_service()
 
-        # Read only first 5 columns (A:E) - enough for default layout and efficient for large sheets
+        # Efficient range: enough for time/device/msg_type for the standard header
         rng = f"{GDRIVE_EVENTS_TAB_NAME}!A:E"
-        values = sheets.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get("values", [])
+        values = sheets.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get('values', [])
 
         if not values or len(values) < 2:
             return {
-                "ok": True,
-                "device_id": device_id,
-                "msg_type": msg_type,
-                "minutes": list(range(60)),
-                "counts": [0] * 60,
-                "smoothed": [0] * 60,
-                "total": 0,
-                "source": "gsheets",
+                'ok': True,
+                'device_id': device_id,
+                'msg_type': msg_type,
+                'minutes': list(range(60)),
+                'counts': [0] * 60,
+                'smoothed': [0] * 60,
+                'total': 0,
+                'source': 'gsheets',
+                'min_outage_minutes': CHARTS_MIN_OUTAGE_MINUTES,
             }
 
         header = values[0]
@@ -1410,36 +1483,47 @@ def compute_minute_hist_from_gsheets(device_id: str, msg_type: str):
         # A received_at_kyiv, B occur_time, C device_id, D device_name, E msg_type
         i_time, i_dev, i_type = 0, 2, 4
 
-        # If header names exist, try to map by name (to be more robust)
+        # Map by header names if present
         try:
             if isinstance(header, list) and header:
-                if "received_at_kyiv" in header:
-                    i_time = header.index("received_at_kyiv")
-                elif "received_at_utc" in header:
-                    i_time = header.index("received_at_utc")
-                if "device_id" in header:
-                    i_dev = header.index("device_id")
-                if "msg_type" in header:
-                    i_type = header.index("msg_type")
+                if 'received_at_kyiv' in header:
+                    i_time = header.index('received_at_kyiv')
+                elif 'received_at_utc' in header:
+                    i_time = header.index('received_at_utc')
+                if 'device_id' in header:
+                    i_dev = header.index('device_id')
+                if 'msg_type' in header:
+                    i_type = header.index('msg_type')
         except Exception:
             pass
+
+        # Build status-change timeline and outages
+        events = _extract_status_events(values, device_id=device_id, i_time=i_time, i_dev=i_dev, i_type=i_type)
+        outages = _compute_outages_from_status_events(events)
+
+        threshold_sec = int(CHARTS_MIN_OUTAGE_MINUTES) * 60
+        now_dt = datetime.now(KYIV_TZ)
 
         counts = [0] * 60
         total = 0
 
-        for row in values[1:]:
-            if not row:
-                continue
-            if len(row) <= max(i_time, i_dev, i_type):
-                continue
-            if (row[i_dev] or "").strip() != (device_id or "").strip():
-                continue
-            if (row[i_type] or "").strip() != (msg_type or "").strip():
+        for start_dt, end_dt in outages:
+            end_eff = end_dt or now_dt
+            # Ensure tz compatible
+            start_dt = _dt_ensure_tz(start_dt)
+            end_eff = _dt_ensure_tz(end_eff)
+
+            dur = int((end_eff - start_dt).total_seconds())
+            if dur < threshold_sec:
                 continue
 
-            minute = _safe_fromiso_minute(row[i_time])
-            if minute is None:
-                continue
+            if msg_type == 'offline':
+                minute = int(start_dt.minute)
+            else:  # online
+                if end_dt is None:
+                    continue  # no restore yet
+                minute = int(end_dt.minute)
+
             if 0 <= minute <= 59:
                 counts[minute] += 1
                 total += 1
@@ -1447,28 +1531,31 @@ def compute_minute_hist_from_gsheets(device_id: str, msg_type: str):
         smoothed = _gaussian_smooth_60(counts, sigma=CHARTS_SMOOTH_SIGMA)
 
         return {
-            "ok": True,
-            "device_id": device_id,
-            "msg_type": msg_type,
-            "minutes": list(range(60)),
-            "counts": counts,
-            "smoothed": smoothed,
-            "total": total,
-            "source": "gsheets",
+            'ok': True,
+            'device_id': device_id,
+            'msg_type': msg_type,
+            'minutes': list(range(60)),
+            'counts': counts,
+            'smoothed': smoothed,
+            'total': total,
+            'source': 'gsheets',
+            'min_outage_minutes': CHARTS_MIN_OUTAGE_MINUTES,
         }
 
     except Exception as e:
         return {
-            "ok": False,
-            "error": str(e),
-            "device_id": device_id,
-            "msg_type": msg_type,
-            "minutes": list(range(60)),
-            "counts": [0] * 60,
-            "smoothed": [0] * 60,
-            "total": 0,
-            "source": "gsheets",
+            'ok': False,
+            'error': str(e),
+            'device_id': device_id,
+            'msg_type': msg_type,
+            'minutes': list(range(60)),
+            'counts': [0] * 60,
+            'smoothed': [0] * 60,
+            'total': 0,
+            'source': 'gsheets',
+            'min_outage_minutes': CHARTS_MIN_OUTAGE_MINUTES,
         }
+
 
 
 @app.get("/api/charts/minute-hist")
@@ -1489,6 +1576,140 @@ def api_charts_minute_hist():
     _charts_cache_set(cache_key, data)
     return jsonify(data)
 
+
+
+
+
+def compute_power_ratio_parking_from_gsheets():
+    """Compute total ONLINE vs OFFLINE hours for the Parking device, based on status changes in Events sheet."""
+    device_id = (TELEGRAM_PARKING_DEVICE_ID or '').strip()
+    device_name = (TELEGRAM_PARKING_DEVICE_NAME or 'Парковка').strip()
+
+    if not google_enabled():
+        return {
+            'ok': False,
+            'error': 'Google is disabled (missing GDRIVE_SA_JSON_B64)',
+            'device_id': device_id,
+            'device_name': device_name,
+            'online_hours': 0.0,
+            'offline_hours': 0.0,
+            'total_hours': 0.0,
+            'range_from': None,
+            'range_to': None,
+            'source': 'gsheets',
+        }
+
+    try:
+        sid = ensure_events_spreadsheet_id()
+        sheets = get_sheets_service()
+
+        rng = f"{GDRIVE_EVENTS_TAB_NAME}!A:E"
+        values = sheets.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get('values', [])
+        if not values or len(values) < 2:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'online_hours': 0.0,
+                'offline_hours': 0.0,
+                'total_hours': 0.0,
+                'range_from': None,
+                'range_to': None,
+                'source': 'gsheets',
+            }
+
+        header = values[0]
+        i_time, i_dev, i_type = 0, 2, 4
+        try:
+            if isinstance(header, list) and header:
+                if 'received_at_kyiv' in header:
+                    i_time = header.index('received_at_kyiv')
+                elif 'received_at_utc' in header:
+                    i_time = header.index('received_at_utc')
+                if 'device_id' in header:
+                    i_dev = header.index('device_id')
+                if 'msg_type' in header:
+                    i_type = header.index('msg_type')
+        except Exception:
+            pass
+
+        events = _extract_status_events(values, device_id=device_id, i_time=i_time, i_dev=i_dev, i_type=i_type)
+        if not events:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'online_hours': 0.0,
+                'offline_hours': 0.0,
+                'total_hours': 0.0,
+                'range_from': None,
+                'range_to': None,
+                'source': 'gsheets',
+            }
+
+        online_sec = 0
+        offline_sec = 0
+
+        last_dt, last_st = events[0]
+        range_from = last_dt
+
+        for dt, st in events[1:]:
+            seg = int((dt - last_dt).total_seconds())
+            if seg > 0:
+                if last_st == 'online':
+                    online_sec += seg
+                elif last_st == 'offline':
+                    offline_sec += seg
+            last_dt, last_st = dt, st
+
+        # extend the last segment to now (assume status persisted)
+        now_dt = datetime.now(KYIV_TZ)
+        seg = int((now_dt - last_dt).total_seconds())
+        if seg > 0:
+            if last_st == 'online':
+                online_sec += seg
+            elif last_st == 'offline':
+                offline_sec += seg
+
+        total_sec = online_sec + offline_sec
+
+        return {
+            'ok': True,
+            'device_id': device_id,
+            'device_name': device_name,
+            'online_hours': round(online_sec / 3600.0, 2),
+            'offline_hours': round(offline_sec / 3600.0, 2),
+            'total_hours': round(total_sec / 3600.0, 2),
+            'range_from': range_from.isoformat() if range_from else None,
+            'range_to': now_dt.isoformat(),
+            'source': 'gsheets',
+        }
+
+    except Exception as e:
+        return {
+            'ok': False,
+            'error': str(e),
+            'device_id': device_id,
+            'device_name': device_name,
+            'online_hours': 0.0,
+            'offline_hours': 0.0,
+            'total_hours': 0.0,
+            'range_from': None,
+            'range_to': None,
+            'source': 'gsheets',
+        }
+
+
+@app.get('/api/charts/power-ratio')
+def api_charts_power_ratio():
+    cache_key = f"power_ratio:{TELEGRAM_PARKING_DEVICE_ID or ''}"
+    cached = _charts_cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    data = compute_power_ratio_parking_from_gsheets()
+    _charts_cache_set(cache_key, data)
+    return jsonify(data)
 
 @app.get("/charts")
 def charts_page():
@@ -1551,7 +1772,7 @@ def charts_page():
       </div>
 
       <div>
-        <button onclick="reloadChart()">Refresh</button>
+        <button onclick="refreshAll()">Refresh</button>
       </div>
 
       <div class="muted" id="meta" style="padding-bottom:6px;"></div>
@@ -1562,8 +1783,14 @@ def charts_page():
     <canvas id="chart" height="120"></canvas>
   </div>
 
+  <div class="card" style="margin-top:14px;">
+    <div class="muted" id="ratio_meta" style="margin-bottom:8px;"></div>
+    <canvas id="ratioChart" height="120"></canvas>
+  </div>
+
 <script>
 let chartObj = null;
+let ratioObj = null;
 
 async function reloadChart(){
   const device = document.getElementById('device').value;
@@ -1580,7 +1807,8 @@ async function reloadChart(){
     return;
   }
 
-  metaEl.textContent = `Total events: ${data.total} (source: ${data.source || 'unknown'})`;
+  const minOut = data.min_outage_minutes ?? 10;
+  metaEl.textContent = `Total (filtered): ${data.total} | ignore outages < ${minOut} min | source: ${data.source || 'unknown'}`;
 
   const labels = data.minutes.map(m => String(m).padStart(2,'0'));
   const counts = data.counts;
@@ -1612,7 +1840,47 @@ async function reloadChart(){
   });
 }
 
-reloadChart();
+async function reloadRatio(){
+  const metaEl = document.getElementById('ratio_meta');
+  metaEl.textContent = 'Loading ratio...';
+
+  const res = await fetch('/api/charts/power-ratio');
+  const data = await res.json();
+
+  if (!data.ok){
+    metaEl.textContent = 'Error: ' + (data.error || 'unknown');
+    return;
+  }
+
+  metaEl.textContent = `${data.device_name} (${data.device_id}) | online: ${data.online_hours}h, offline: ${data.offline_hours}h | from ${data.range_from || '-'} to ${data.range_to || '-'}`;
+
+  const ctx = document.getElementById('ratioChart').getContext('2d');
+  if (ratioObj) ratioObj.destroy();
+
+  ratioObj = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: ['Light ON (hours)', 'Light OFF (hours)'],
+      datasets: [{
+        data: [data.online_hours, data.offline_hours]
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        title: { display: true, text: 'Power availability ratio (Parking) — hours' },
+        tooltip: { mode: 'nearest' }
+      }
+    }
+  });
+}
+
+function refreshAll(){
+  reloadChart();
+  reloadRatio();
+}
+
+refreshAll();
 </script>
 
 </body>

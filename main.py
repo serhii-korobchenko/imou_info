@@ -6,6 +6,8 @@ import hashlib
 import sqlite3
 import base64
 import math
+import re
+import asyncio
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -118,6 +120,32 @@ TELEGRAM_PARKING_DEVICE_ID = os.getenv("TELEGRAM_PARKING_DEVICE_ID", "14062AEPBV
 TELEGRAM_PARKING_DEVICE_NAME = os.getenv("TELEGRAM_PARKING_DEVICE_NAME", "Парковка").strip()
 
 
+# -----------------------------
+# DTEK forecast (optional)
+# -----------------------------
+# NOTE:
+# - Telegram Bot API cannot read messages from other bots.
+# - To pull data from @DTEKKyivskielectromerezhibot automatically, we use a Telegram *user* session via Telethon (MTProto).
+# - This feature is OPTIONAL and does nothing unless DTEK_FORECAST_ENABLED=1 and Telethon creds are provided.
+DTEK_FORECAST_ENABLED = env_bool("DTEK_FORECAST_ENABLED", False)
+DTEK_BOT_USERNAME = os.getenv("DTEK_BOT_USERNAME", "DTEKKyivskielectromerezhibot").strip().lstrip("@")
+
+# Telethon (MTProto user session) credentials
+DTEK_TG_API_ID = os.getenv("DTEK_TG_API_ID", "").strip()
+DTEK_TG_API_HASH = os.getenv("DTEK_TG_API_HASH", "").strip()
+# Preferred: StringSession (single env var, no local session file needed)
+DTEK_TG_SESSION = os.getenv("DTEK_TG_SESSION", "").strip()
+# Alternative: session file path (should be on a persistent volume if you use it)
+DTEK_TG_SESSION_FILE = os.getenv("DTEK_TG_SESSION_FILE", os.path.join(DATA_DIR, "dtek_user.session")).strip()
+
+# Menu navigation inside DTEK bot (pipe-separated). Default reflects what DTEK announced publicly.
+# You may need to adjust if DTEK changes labels.
+DTEK_MENU_SEQUENCE = os.getenv("DTEK_MENU_SEQUENCE", "Меню|Графік відключень").strip()
+DTEK_FETCH_TIMEOUT_SEC = int(os.getenv("DTEK_FETCH_TIMEOUT_SEC", "20"))
+DTEK_FORECAST_CACHE_SEC = int(os.getenv("DTEK_FORECAST_CACHE_SEC", "300"))
+DTEK_ATTACH_TO_OFFLINE_ALERT = env_bool("DTEK_ATTACH_TO_OFFLINE_ALERT", True)
+
+
 # Debug: store raw callback payloads into callback_inbox (keep last 200)
 DEBUG_CALLBACK_INBOX = env_bool("DEBUG_CALLBACK_INBOX", False)
 CALLBACK_INBOX_MAX = int(os.getenv("CALLBACK_INBOX_MAX", "200"))
@@ -196,12 +224,27 @@ def maybe_notify_telegram_device_status(device_id: str, status: str, interval_no
         return
     if st not in ("online", "offline"):
         return
-    emoji = '🟢' if st == 'online' else '🔴'
-    base = f"{emoji} ДАЛИ СВІТЛО" if st == 'online' else f"{emoji} ВІДКЛЮЧИЛИ СВІТЛО"
+
+    emoji = "🟢" if st == "online" else "🔴"
+    base = f"{emoji} ДАЛИ СВІТЛО" if st == "online" else f"{emoji} ВІДКЛЮЧИЛИ СВІТЛО"
 
     text = base
     if interval_note:
         text = f"{base}\n{interval_note}"
+
+    # Optional: attach DTEK forecast to OFFLINE alerts
+    if st == "offline" and DTEK_ATTACH_TO_OFFLINE_ALERT:
+        try:
+            fc = dtek_get_forecast_cached()
+            if isinstance(fc, dict):
+                restore = (fc.get("restore_at_kyiv") or "").strip()
+                note = (fc.get("note") or "").strip()
+                if restore:
+                    text += f"\n⏱️ Прогноз включення (ДТЕК): {restore}"
+                elif note and (fc.get("ok") or note == "відключень не планується"):
+                    text += f"\n⏱️ ДТЕК: {note}"
+        except Exception as e:
+            app.logger.warning(f"DTEK forecast failed: {e}")
 
     res = telegram_send_message(text)
 
@@ -308,6 +351,243 @@ def kv_set(key: str, value: str):
     conn.commit()
     conn.close()
 
+
+
+# -----------------------------
+# DTEK forecast via Telegram (Telethon user session)
+# -----------------------------
+_DTEK_CACHE_KEY = "dtek_forecast_cache_v1"
+
+
+def _dtek_feature_ready() -> tuple[bool, str]:
+    if not DTEK_FORECAST_ENABLED:
+        return False, "DTEK_FORECAST_ENABLED=0"
+    if not (DTEK_TG_API_ID and DTEK_TG_API_HASH):
+        return False, "Missing DTEK_TG_API_ID / DTEK_TG_API_HASH"
+    if not (DTEK_TG_SESSION or DTEK_TG_SESSION_FILE):
+        return False, "Missing DTEK_TG_SESSION or DTEK_TG_SESSION_FILE"
+    return True, ""
+
+
+def _dtek_cache_load() -> dict:
+    try:
+        raw = kv_get(_DTEK_CACHE_KEY)
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def _dtek_cache_save(obj: dict):
+    try:
+        kv_set(_DTEK_CACHE_KEY, json.dumps(obj, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def _dtek_format_dt(dt: datetime) -> str:
+    dt = dt.astimezone(KYIV_TZ)
+    return dt.strftime("%H:%M (%d.%m)")
+
+
+def _dtek_parse_restore_from_text(text: str) -> dict:
+    """
+    Best-effort parser for DTEK bot messages.
+    Returns:
+      {
+        ok: bool,
+        restore_dt_iso: str|None,    # Kyiv timezone ISO
+        restore_at_kyiv: str|None,   # formatted: HH:MM (dd.mm)
+        note: str,                  # fallback / explanation
+        raw: str                    # clipped original text
+      }
+    """
+    now_dt = datetime.now(KYIV_TZ)
+    t = (text or "").strip()
+    t_norm = " ".join(t.split())
+    raw_clip = t[:4000]
+
+    if not t_norm:
+        return {"ok": False, "note": "empty response", "raw": raw_clip}
+
+    # If DTEK explicitly says there are no outages
+    if re.search(r"(відключень\s+не\s+буде|не\s+планується\s+відключень|відключення\s+не\s+передбачені)", t_norm, re.IGNORECASE):
+        return {"ok": True, "restore_dt_iso": None, "restore_at_kyiv": None, "note": "відключень не планується", "raw": raw_clip}
+
+    # 1) Try datetime with date + time (any order)
+    # Examples: '03.02 18:30', '18:30 03/02/2026'
+    m = re.search(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?\s*(?:о\s*)?(\d{1,2})[:.](\d{2})", t_norm)
+    if not m:
+        m = re.search(r"(\d{1,2})[:.](\d{2})\s*(?:,?\s*|о\s*)(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", t_norm)
+        if m:
+            hh, mm, dd, mo, yy = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+            dd, mo = int(dd), int(mo)
+            yy = int(yy) if yy else now_dt.year
+            if yy < 100:
+                yy += 2000
+            dt = datetime(yy, mo, dd, int(hh), int(mm), tzinfo=KYIV_TZ)
+            return {"ok": True, "restore_dt_iso": dt.isoformat(), "restore_at_kyiv": _dtek_format_dt(dt), "note": "", "raw": raw_clip}
+    else:
+        dd, mo, yy, hh, mm = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        dd, mo = int(dd), int(mo)
+        yy = int(yy) if yy else now_dt.year
+        if yy < 100:
+            yy += 2000
+        dt = datetime(yy, mo, dd, int(hh), int(mm), tzinfo=KYIV_TZ)
+        return {"ok": True, "restore_dt_iso": dt.isoformat(), "restore_at_kyiv": _dtek_format_dt(dt), "note": "", "raw": raw_clip}
+
+    # 2) Try typical phrase with only time: 'до 18:30', 'очікуваний час відновлення 18:30'
+    # We prefer matches that appear close to keywords.
+    time_candidates = []
+
+    for rx in [
+        r"(?:очікуван\w*\s+час\s+(?:відновлення|включення)[^\d]{0,20})(\d{1,2})[:.](\d{2})",
+        r"(?:відновлен\w*[^\d]{0,20})(\d{1,2})[:.](\d{2})",
+        r"(?:включен\w*[^\d]{0,20})(\d{1,2})[:.](\d{2})",
+        r"\bдо\s*(\d{1,2})[:.](\d{2})\b",
+    ]:
+        for m in re.finditer(rx, t_norm, re.IGNORECASE):
+            hh, mm = int(m.group(1)), int(m.group(2))
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                time_candidates.append((m.start(), hh, mm, rx))
+
+    if time_candidates:
+        # earliest keyword match
+        time_candidates.sort(key=lambda x: x[0])
+        _, hh, mm, _ = time_candidates[0]
+        dt = datetime(now_dt.year, now_dt.month, now_dt.day, hh, mm, tzinfo=KYIV_TZ)
+        # If time already passed significantly, assume next day
+        if dt < now_dt - timedelta(minutes=30):
+            dt = dt + timedelta(days=1)
+        return {"ok": True, "restore_dt_iso": dt.isoformat(), "restore_at_kyiv": _dtek_format_dt(dt), "note": "", "raw": raw_clip}
+
+    # 3) Fallback: no parse
+    return {"ok": False, "note": "не вдалося розпізнати прогноз часу включення з відповіді ДТЕК", "raw": raw_clip}
+
+
+async def _dtek_fetch_text_via_telethon() -> dict:
+    """Fetch outage schedule / status text from DTEK bot via Telethon user session (best-effort)."""
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+    except Exception as e:
+        return {"ok": False, "error": f"Telethon not installed: {e}"}
+
+    try:
+        api_id = int(DTEK_TG_API_ID)
+    except Exception:
+        return {"ok": False, "error": "Invalid DTEK_TG_API_ID (must be int)"}
+
+    api_hash = DTEK_TG_API_HASH
+    session = StringSession(DTEK_TG_SESSION) if DTEK_TG_SESSION else DTEK_TG_SESSION_FILE
+
+    steps = [s.strip() for s in (DTEK_MENU_SEQUENCE or "").split("|") if s.strip()]
+
+    try:
+        async with TelegramClient(session, api_id, api_hash) as client:
+            if not await client.is_user_authorized():
+                return {
+                    "ok": False,
+                    "error": "Telethon session is not authorized. Create DTEK_TG_SESSION (StringSession) first.",
+                }
+
+            bot = await client.get_entity(DTEK_BOT_USERNAME)
+
+            collected_texts = []
+
+            # If we have a menu sequence, try to "click" via sending the same text.
+            if steps:
+                try:
+                    async with client.conversation(bot, timeout=max(5, DTEK_FETCH_TIMEOUT_SEC)) as conv:
+                        for step in steps:
+                            await conv.send_message(step)
+                            resp = await conv.get_response()
+                            if resp and (resp.raw_text or resp.message):
+                                collected_texts.append(resp.raw_text or resp.message or "")
+
+                        # Some bots send multiple messages; collect a few extra quickly
+                        for _ in range(4):
+                            try:
+                                resp = await asyncio.wait_for(conv.get_response(), timeout=1.5)
+                            except Exception:
+                                break
+                            if resp and (resp.raw_text or resp.message):
+                                collected_texts.append(resp.raw_text or resp.message or "")
+                except Exception as e:
+                    # Fallback to reading last messages
+                    app.logger.warning(f"DTEK conversation flow failed, fallback to history: {e}")
+
+            if not collected_texts:
+                msgs = await client.get_messages(bot, limit=6)
+                msgs = list(reversed(msgs))
+                for m in msgs:
+                    if m and (m.raw_text or m.message):
+                        collected_texts.append(m.raw_text or m.message or "")
+
+            text = "\n\n".join([t for t in collected_texts if (t or '').strip()]).strip()
+            return {"ok": True, "text": text}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def dtek_get_forecast_cached(force: bool = False) -> dict:
+    """
+    Public wrapper used by Telegram alerts.
+    Uses SQLite kv cache to avoid frequent calls to DTEK bot.
+    """
+    ok, reason = _dtek_feature_ready()
+    if not ok:
+        return {"ok": False, "note": reason}
+
+    now_ts = time.time()
+    cached = _dtek_cache_load()
+    try:
+        cached_ts = float(cached.get("ts_epoch") or 0.0)
+    except Exception:
+        cached_ts = 0.0
+
+    if (not force) and cached and (now_ts - cached_ts) < max(30, int(DTEK_FORECAST_CACHE_SEC or 300)):
+        return cached
+
+    # Fetch + parse (best-effort)
+    try:
+        res = asyncio.run(asyncio.wait_for(_dtek_fetch_text_via_telethon(), timeout=max(6, DTEK_FETCH_TIMEOUT_SEC)))
+    except RuntimeError:
+        # If we're already in an event loop (rare in Flask), create a new loop
+        loop = asyncio.new_event_loop()
+        try:
+            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_text_via_telethon(), timeout=max(6, DTEK_FETCH_TIMEOUT_SEC)))
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+    except Exception as e:
+        res = {"ok": False, "error": str(e)}
+
+    out = {
+        "ok": False,
+        "ts_epoch": now_ts,
+        "ts_kyiv": now_kyiv_iso(),
+        "restore_dt_iso": None,
+        "restore_at_kyiv": None,
+        "note": "",
+        "raw": "",
+        "error": "",
+    }
+
+    if not res.get("ok"):
+        out["error"] = str(res.get("error") or "unknown error")
+        out["note"] = "DTEK fetch failed"
+        _dtek_cache_save(out)
+        return out
+
+    parsed = _dtek_parse_restore_from_text(res.get("text") or "")
+    out.update(parsed)
+    out["ok"] = bool(parsed.get("ok"))
+    out["ts_epoch"] = now_ts
+    out["ts_kyiv"] = now_kyiv_iso()
+    _dtek_cache_save(out)
+    return out
 
 def upsert_device(device_id: str, **fields):
     keys = []
@@ -986,6 +1266,36 @@ def admin_test_telegram():
     text = (body.get("text") or f"{TELEGRAM_PARKING_DEVICE_NAME} ({TELEGRAM_PARKING_DEVICE_ID}) - deviceStatus: online").strip()
     res = telegram_send_message(text)
     return jsonify(res)
+
+
+@app.get("/admin/dtek-forecast")
+def admin_dtek_forecast():
+    """Debug endpoint: fetch & parse DTEK forecast (does NOT send anything)."""
+    require_admin()
+    force = request.args.get("force", "0").strip() in ("1", "true", "yes", "y", "on")
+    res = dtek_get_forecast_cached(force=force)
+    return jsonify(res)
+
+
+@app.post("/admin/dtek-notify")
+def admin_dtek_notify():
+    """Debug endpoint: send current DTEK forecast to the configured Telegram channel."""
+    require_admin()
+    res = dtek_get_forecast_cached(force=True)
+    if not telegram_enabled():
+        return jsonify({"ok": False, "error": "telegram disabled or missing TELEGRAM_* env"}), 400
+
+    msg = "⏱️ Прогноз ДТЕК: "
+    if res.get("restore_at_kyiv"):
+        msg += f"очікуване включення {res.get('restore_at_kyiv')}"
+    elif res.get("note"):
+        msg += res.get("note")
+    else:
+        msg += "дані недоступні"
+
+    send_res = telegram_send_message(msg)
+    return jsonify({"forecast": res, "telegram": send_res})
+
 
 
 

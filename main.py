@@ -140,7 +140,7 @@ DTEK_TG_SESSION_FILE = os.getenv("DTEK_TG_SESSION_FILE", os.path.join(DATA_DIR, 
 
 # Menu navigation inside DTEK bot (pipe-separated). Default reflects what DTEK announced publicly.
 # You may need to adjust if DTEK changes labels.
-DTEK_MENU_SEQUENCE = os.getenv("DTEK_MENU_SEQUENCE", "Графік відключень").strip()
+DTEK_MENU_SEQUENCE = os.getenv("DTEK_MENU_SEQUENCE", "Можливі відключення").strip()
 DTEK_FETCH_TIMEOUT_SEC = int(os.getenv("DTEK_FETCH_TIMEOUT_SEC", "20"))
 DTEK_FORECAST_CACHE_SEC = int(os.getenv("DTEK_FORECAST_CACHE_SEC", "300"))
 DTEK_ATTACH_TO_OFFLINE_ALERT = env_bool("DTEK_ATTACH_TO_OFFLINE_ALERT", True)
@@ -386,7 +386,7 @@ def _dtek_cache_save(obj: dict):
 
 def _dtek_format_dt(dt: datetime) -> str:
     dt = dt.astimezone(KYIV_TZ)
-    return dt.strftime("%H:%M (%d.%m)")
+    return dt.strftime("%d.%m.%Y %H:%M")
 
 
 def _dtek_parse_restore_from_text(text: str) -> dict:
@@ -413,29 +413,80 @@ def _dtek_parse_restore_from_text(text: str) -> dict:
     if re.search(r"(відключень\s+не\s+буде|не\s+планується\s+відключень|відключення\s+не\s+передбачені)", t_norm, re.IGNORECASE):
         return {"ok": True, "restore_dt_iso": None, "restore_at_kyiv": None, "note": "відключень не планується", "raw": raw_clip}
 
-    # 1) Try datetime with date + time (any order)
-    # Examples: '03.02 18:30', '18:30 03/02/2026'
-    m = re.search(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?\s*(?:о\s*)?(\d{1,2})[:.](\d{2})", t_norm)
-    if not m:
-        m = re.search(r"(\d{1,2})[:.](\d{2})\s*(?:,?\s*|о\s*)(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", t_norm)
-        if m:
-            hh, mm, dd, mo, yy = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+    # 0) Most reliable: explicit phrase used by DTEK bot
+    # Example (from your screenshot):
+    #   "Орієнтовний час відновлення електроенергії: 03.02.2026 21:00."
+    # NOTE: This must take priority, because the same message may also contain "Час початку: ...",
+    # and a generic date+time regex would otherwise pick the *start* time by accident.
+    for rx in [
+        r"(?:орієнтовн\w*\s+час\s+відновлення\s+електроенергії\s*[:\-]?\s*)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\s+(\d{1,2})[:.](\d{2})",
+        r"(?:орієнтовн\w*\s+час\s+відновлення\s*[:\-]?\s*)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\s+(\d{1,2})[:.](\d{2})",
+        r"(?:очікуван\w*\s+час\s+відновлення\s*(?:електроенергії)?\s*[:\-]?\s*)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\s+(\d{1,2})[:.](\d{2})",
+    ]:
+        m0 = re.search(rx, t_norm, re.IGNORECASE)
+        if m0:
+            dd, mo, yy, hh, mm = m0.group(1), m0.group(2), m0.group(3), m0.group(4), m0.group(5)
             dd, mo = int(dd), int(mo)
             yy = int(yy) if yy else now_dt.year
             if yy < 100:
                 yy += 2000
             dt = datetime(yy, mo, dd, int(hh), int(mm), tzinfo=KYIV_TZ)
             return {"ok": True, "restore_dt_iso": dt.isoformat(), "restore_at_kyiv": _dtek_format_dt(dt), "note": "", "raw": raw_clip}
-    else:
-        dd, mo, yy, hh, mm = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
-        dd, mo = int(dd), int(mo)
-        yy = int(yy) if yy else now_dt.year
-        if yy < 100:
-            yy += 2000
-        dt = datetime(yy, mo, dd, int(hh), int(mm), tzinfo=KYIV_TZ)
+
+    # 1) Try any date+time occurrences, but prefer those close to "відновлення/включення" keywords.
+    # This avoids accidentally picking the *start* time when both start & restore are present.
+    dt_candidates = []
+
+    def _score_ctx(pos: int) -> int:
+        ctx = t_norm[max(0, pos - 90):pos].casefold()
+        score = 0
+        if ("віднов" in ctx) or ("включ" in ctx):
+            score += 10
+        if ("орієнтов" in ctx) or ("очікуван" in ctx):
+            score += 5
+        if ("почат" in ctx):
+            score -= 10
+        return score
+
+    # Pattern A: date then time
+    for m1 in re.finditer(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?\s*(?:о\s*)?(\d{1,2})[:.](\d{2})", t_norm):
+        dd, mo, yy, hh, mm = m1.group(1), m1.group(2), m1.group(3), m1.group(4), m1.group(5)
+        try:
+            dd, mo = int(dd), int(mo)
+            hh, mm = int(hh), int(mm)
+            if not (1 <= dd <= 31 and 1 <= mo <= 12 and 0 <= hh <= 23 and 0 <= mm <= 59):
+                continue
+            yy = int(yy) if yy else now_dt.year
+            if yy < 100:
+                yy += 2000
+        except Exception:
+            continue
+        dt_candidates.append((_score_ctx(m1.start()), m1.start(), yy, mo, dd, hh, mm))
+
+    # Pattern B: time then date
+    for m1 in re.finditer(r"(\d{1,2})[:.](\d{2})\s*(?:,?\s*|о\s*)(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", t_norm):
+        hh, mm, dd, mo, yy = m1.group(1), m1.group(2), m1.group(3), m1.group(4), m1.group(5)
+        try:
+            dd, mo = int(dd), int(mo)
+            hh, mm = int(hh), int(mm)
+            if not (1 <= dd <= 31 and 1 <= mo <= 12 and 0 <= hh <= 23 and 0 <= mm <= 59):
+                continue
+            yy = int(yy) if yy else now_dt.year
+            if yy < 100:
+                yy += 2000
+        except Exception:
+            continue
+        dt_candidates.append((_score_ctx(m1.start()), m1.start(), yy, mo, dd, hh, mm))
+
+    if dt_candidates:
+        # higher score first, then earlier in text
+        dt_candidates.sort(key=lambda x: (-x[0], x[1]))
+        _, _, yy, mo, dd, hh, mm = dt_candidates[0]
+        dt = datetime(yy, mo, dd, hh, mm, tzinfo=KYIV_TZ)
         return {"ok": True, "restore_dt_iso": dt.isoformat(), "restore_at_kyiv": _dtek_format_dt(dt), "note": "", "raw": raw_clip}
 
-    # 2) Try typical phrase with only time: 'до 18:30', 'очікуваний час відновлення 18:30'
+    # 2) Try typical phrase with only time:
+    # Examples: 'до 18:30', 'очікуваний час відновлення 18:30'
     # We prefer matches that appear close to keywords.
     time_candidates = []
 
@@ -495,8 +546,9 @@ async def _dtek_fetch_text_via_telethon() -> dict:
 
     session = StringSession(DTEK_TG_SESSION) if DTEK_TG_SESSION else DTEK_TG_SESSION_FILE
 
-    # Steps: pipe-separated labels we want to press. For your screenshot:
-    #   "Графік відключень"
+    # Steps: pipe-separated labels we want to press. For your menu:
+    #   "Можливі відключення"
+    # (If you want the schedule image instead, use "Графік відключень".)
     steps = [s.strip() for s in (DTEK_MENU_SEQUENCE or "").split("|") if s.strip()]
 
     def _iter_button_texts(msg):

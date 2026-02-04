@@ -238,20 +238,37 @@ def telegram_send_message(text: str) -> dict:
 def _run_dtek_forecast_message(device_id: str, device_name: str, offline_ts: float | None = None):
     """Runs in a background thread (Timer). Fetches DTEK forecast and sends it to the channel as a separate message."""
     try:
-        fc = dtek_get_forecast_since_offline(offline_ts=offline_ts, force=True)
-        if not isinstance(fc, dict):
-            return
-        restore = (fc.get("restore_at_kyiv") or "").strip()
-        note = (fc.get("note") or "").strip()
+        retry_count = max(1, int(os.getenv("DTEK_RETRY_COUNT", "3")))
+        retry_interval = max(15, int(os.getenv("DTEK_RETRY_INTERVAL_SEC", "60")))
 
-        if restore:
-            msg = f"💡 ДТЕК прогноз відновлення електроенергії ({device_name}): {restore}"
-        elif note:
-            msg = f"💡 ДТЕК ({device_name}): {note}"
+        last_note = ""
+        for i in range(retry_count):
+            fc = dtek_get_forecast_since_offline(offline_ts=offline_ts, force=True)
+            if isinstance(fc, dict):
+                restore = (fc.get("restore_at_kyiv") or "").strip()
+                note = (fc.get("note") or "").strip()
+                last_note = note or last_note
+
+                if restore:
+                    msg = f"💡 ДТЕК прогноз відновлення електроенергії ({device_name}): {restore}"
+                    telegram_send_message(msg)
+                    return
+
+                # If bot says clearly there are no outages / no data, don't hammer retries
+                if note and ("не планується" in note.casefold() or "немає" in note.casefold()):
+                    break
+
+            # wait before next attempt (do not send failure message yet)
+            if i < (retry_count - 1):
+                time.sleep(retry_interval)
+
+        # After retries: send a friendly note (not "fetch failed")
+        if last_note:
+            msg = f"💡 ДТЕК ({device_name}): {last_note}"
         else:
-            msg = f"💡 ДТЕК ({device_name}): не вдалося отримати прогноз відновлення"
-
+            msg = f"💡 ДТЕК ({device_name}): не вдалося отримати прогноз відновлення (спробуйте пізніше)"
         telegram_send_message(msg)
+
     except Exception as e:
         try:
             app.logger.warning(f"DTEK delayed forecast failed: {e}")
@@ -605,14 +622,18 @@ def _dtek_parse_restore_from_text(text: str) -> dict:
 
 async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
     """
-    Fetch DTEK bot responses and navigate the reply-keyboard menu to reach "💡 Можливі відключення".
+    Fetch DTEK bot text via Telethon user session.
 
-    Notes:
-      - DTEK uses a *reply keyboard* (not inline). The safest way is to send the exact button text.
-      - Some Telethon builds may not expose reply keyboard buttons reliably, so we also try known variants
-        (with and without emoji) for the target section.
-      - If the bot responds with "Час очікування вичерпано..." and returns to the main menu, we retry.
-      - We collect multiple consecutive bot messages because DTEK may send several blocks/messages.
+    IMPORTANT:
+      - We avoid Telethon "conversation" here because in production (gunicorn + threads) it can emit
+        asyncio InvalidStateError warnings (race between futures and incoming updates).
+      - Primary strategy: read the latest DTEK outage notification from chat history (this is what actually
+        contains "Орієнтовний час відновлення електроенергії: ...").
+      - Fallback: "poke" the bot by sending /start and the menu label, then poll history again.
+
+    Returns:
+      {"ok": True, "text": "...", "source": "history|poke|history_tail"}
+      or {"ok": False, "error": "..."}
     """
     if not DTEK_FORECAST_ENABLED:
         return {"ok": False, "error": "DTEK_FORECAST_ENABLED is disabled"}
@@ -634,27 +655,13 @@ async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
 
     session = StringSession(DTEK_TG_SESSION) if DTEK_TG_SESSION else DTEK_TG_SESSION_FILE
 
-    # Steps: pipe-separated labels we want to press.
+    # Steps: pipe-separated labels we want to "press" (send as text).
     steps = [s.strip() for s in (DTEK_MENU_SEQUENCE or "").split("|") if s.strip()]
     if not steps:
         steps = ["💡 Можливі відключення"]
 
-    # Retry/nav settings
-    nav_attempts = max(1, int(os.getenv("DTEK_NAV_ATTEMPTS", "3")))
-    extra_collect_max = max(2, int(os.getenv("DTEK_EXTRA_COLLECT_MAX", "6")))
-    per_msg_timeout = max(6, int(DTEK_FETCH_TIMEOUT_SEC or 20))
-
-    TIMEOUT_PHRASES = ("час очікування вичерпано", "переведено у головне меню")
-    MENU_PHRASE = "оберіть потрібний розділ"
-
-    # Phrases that indicate we reached the section we need (the outage message)
-    WANT_HINTS = (
-        "орієнтовний час відновлення",
-        "час початку",
-        "за адресою",
-        "причина:",
-        "стабілізаційні відключення",
-    )
+    per_msg_timeout = max(10, int(DTEK_FETCH_TIMEOUT_SEC or 20))
+    history_limit = max(40, int(os.getenv("DTEK_HISTORY_LIMIT", "60")))
 
     def _safe_text(m) -> str:
         try:
@@ -665,98 +672,29 @@ async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
     def _norm(s: str) -> str:
         return " ".join((s or "").split()).casefold()
 
-    def _looks_useful(s: str) -> bool:
-        x = _norm(s)
-        return any(h in x for h in WANT_HINTS)
-
-    def _looks_like_menu_only(s: str) -> bool:
-        x = _norm(s)
-        if not x:
-            return False
-        # Timeout always means we must restart
-        if any(p in x for p in TIMEOUT_PHRASES):
-            return True
-        # Menu phrase alone (without useful content) => still not in target section
-        if (MENU_PHRASE in x) and (not _looks_useful(s)):
-            return True
-        return False
-
-    def _extract_button_texts(msg):
-        """Best-effort extraction of reply/inline button texts from Telethon message."""
-        out = []
-        # 1) msg.buttons (often inline)
-        btns = getattr(msg, "buttons", None)
-        if btns:
-            try:
-                for row in btns:
-                    for b in row:
-                        t = getattr(b, "text", None)
-                        if t:
-                            out.append(str(t))
-            except Exception:
-                pass
-
-        # 2) reply_markup.rows (reply keyboard)
-        rm = getattr(msg, "reply_markup", None)
-        if rm:
-            rows = getattr(rm, "rows", None)
-            if rows:
-                try:
-                    for r in rows:
-                        bs = getattr(r, "buttons", None) or []
-                        for b in bs:
-                            t = getattr(b, "text", None)
-                            if t:
-                                out.append(str(t))
-                except Exception:
-                    pass
-
-            kb = getattr(rm, "keyboard", None)
-            if kb:
-                try:
-                    for r in kb:
-                        bs = getattr(r, "buttons", None) or r
-                        for b in bs:
-                            t = getattr(b, "text", None)
-                            if t:
-                                out.append(str(t))
-                except Exception:
-                    pass
-
-        # De-dup while preserving order
-        seen = set()
-        uniq = []
-        for t in out:
-            if t not in seen:
-                seen.add(t)
-                uniq.append(t)
-        return uniq
-
-    def _match_button_text(msg, needle: str):
-        n = _norm(needle)
-        if not n:
+    def _msg_ts(m) -> float | None:
+        try:
+            dtm = getattr(m, "date", None)
+            if not dtm:
+                return None
+            # Telethon gives aware datetime in UTC; still, be defensive.
+            if getattr(dtm, "tzinfo", None) is None:
+                dtm = dtm.replace(tzinfo=timezone.utc)
+            return float(dtm.timestamp())
+        except Exception:
             return None
-        for t in _extract_button_texts(msg):
-            if n in _norm(t):
-                return t
-        return None
 
-    def _step_variants(step: str):
-        """Known label variants (with/without emoji) to improve reliability."""
+    def _step_variants(step: str) -> list[str]:
         s = " ".join((step or "").split())
         s_norm = _norm(s)
-
         variants = [s]
 
-        # Most important: "Можливі відключення" button often has 💡 prefix
         if "можливі відключення" in s_norm:
             variants = [
                 "💡 Можливі відключення",
                 "💡Можливі відключення",
                 "Можливі відключення",
             ]
-
-        # Some UIs show emoji at the end for "Графік відключень"
         if "графік відключень" in s_norm:
             variants = [
                 "Графік відключень🕒",
@@ -764,174 +702,101 @@ async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
                 "Графік відключень",
             ]
 
-        # De-dup
-        out = []
-        seen = set()
+        out, seen = [], set()
         for v in variants:
             if v and v not in seen:
                 seen.add(v)
                 out.append(v)
         return out
 
-    async def _collect_followups(conv, collected: list):
-        """Collect several fast follow-up bot messages, if any."""
-        for _ in range(extra_collect_max):
-            try:
-                extra = await asyncio.wait_for(conv.get_response(), timeout=1.2)
-            except Exception:
-                break
-            te = _safe_text(extra)
-            if te:
-                collected.append(te)
-
-    async def _run_once(client) -> list:
+    async def _pick_latest_outage_text(client) -> str | None:
         bot = await client.get_entity(DTEK_BOT_USERNAME)
-        collected = []
+        msgs = await client.get_messages(bot, limit=history_limit)
 
-        async with client.conversation(bot, timeout=per_msg_timeout) as conv:
-            await conv.send_message("/start")
-            msg = await conv.get_response()
-            t0 = _safe_text(msg)
-            if t0:
-                collected.append(t0)
+        want = "орієнтовний час відновлення електроенергії"
+        want2 = "орієнтовний час відновлення"
+        # newest first
+        for m in msgs:
+            # Prefer incoming bot messages
+            try:
+                if getattr(m, "out", False):
+                    continue
+            except Exception:
+                pass
 
-            # Navigate steps (usually a single step: "💡 Можливі відключення")
-            for step in steps:
-                # Prefer exact button text from keyboard, if we can see it
-                exact = _match_button_text(msg, step) if msg else None
-                candidates = []
-                if exact:
-                    candidates.append(exact)
-                candidates.extend(_step_variants(step))
+            t = _safe_text(m)
+            if not t:
+                continue
+            nt = _norm(t)
+            if (want not in nt) and (want2 not in nt):
+                continue
 
-                # Try candidates until we leave the menu
-                last_resp = None
-                for cand in candidates:
-                    try:
-                        await conv.send_message(cand)
-                    except Exception:
-                        # As a fallback, try click (mainly for inline buttons)
-                        try:
-                            if msg:
-                                await msg.click(text=cand)
-                            else:
-                                raise RuntimeError("no msg to click")
-                        except Exception:
-                            # last resort: plain text
-                            await conv.send_message(str(step))
+            if since_ts is not None:
+                mts = _msg_ts(m)
+                if (mts is not None) and (mts < float(since_ts) - 120.0):
+                    continue
 
-                    msg = await conv.get_response()
-                    last_resp = msg
-                    t1 = _safe_text(msg)
-                    if t1:
-                        collected.append(t1)
+            return t
+        return None
 
-                    # Collect quick follow-ups (DTEK may send multiple blocks)
-                    await _collect_followups(conv, collected)
+    async def _history_tail_text(client) -> str:
+        bot = await client.get_entity(DTEK_BOT_USERNAME)
+        msgs = await client.get_messages(bot, limit=15)
+        # oldest->newest
+        msgs = list(reversed(list(msgs)))
+        parts = []
+        for m in msgs:
+            t = _safe_text(m)
+            if t:
+                parts.append(t)
+        return "\n\n".join(parts).strip()
 
-                    joined = "\n\n".join([x for x in collected if (x or "").strip()]).strip()
-
-                    # Success: we reached the info section
-                    if joined and _looks_useful(joined):
-                        return collected
-
-                    # Still at menu/timeout -> try next candidate
-                    if _looks_like_menu_only(t1):
-                        continue
-
-                    # Any other non-menu response: accept and move to next step
-                    break
-
-                # If after trying candidates we are still in menu, keep going (outer retry will handle)
-                if last_resp is not None:
-                    msg = last_resp
-
-        return collected
+    def _make_client():
+        # Avoid receiving updates to reduce background tasks and race conditions.
+        try:
+            return TelegramClient(session, api_id, api_hash, receive_updates=False)
+        except TypeError:
+            # older Telethon without receive_updates
+            return TelegramClient(session, api_id, api_hash)
 
     try:
-        async with TelegramClient(session, api_id, api_hash) as client:
+        async with _make_client() as client:
             if not await client.is_user_authorized():
-                return {
-                    "ok": False,
-                    "error": "Telethon session is not authorized. Create DTEK_TG_SESSION (StringSession) first.",
-                }
+                return {"ok": False, "error": "Telethon session is not authorized. Create DTEK_TG_SESSION first."}
 
+            # 1) Primary: read the latest outage notification since OFFLINE
+            picked = await _pick_latest_outage_text(client)
+            if picked:
+                return {"ok": True, "text": picked, "source": "history"}
 
+            # 2) Fallback: poke bot menu (send /start and menu label variants), then poll history again.
+            bot = await client.get_entity(DTEK_BOT_USERNAME)
+            try:
+                await client.send_message(bot, "/start")
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
 
-
-            # 0) Prefer reading the latest outage notification from history.
-            #    In practice, selecting "💡 Можливі відключення" in the menu often just ENABLES notifications,
-            #    and the actual outage message arrives as a separate bot message later.
-            if since_ts is not None:
-                try:
-                    bot = await client.get_entity(DTEK_BOT_USERNAME)
-                    msgs = await client.get_messages(bot, limit=40)
-                    for m in msgs:  # newest first
-                        tm = _safe_text(m)
-                        if not tm:
-                            continue
-                        nm = _norm(tm)
-                        if "орієнтовний час відновлення" not in nm:
-                            continue
-                        try:
-                            dtm = getattr(m, "date", None)
-                            if dtm is not None:
-                                if getattr(dtm, "tzinfo", None) is None:
-                                    import datetime as _dt
-                                    dtm = dtm.replace(tzinfo=_dt.timezone.utc)
-                                if dtm.timestamp() < float(since_ts) - 120.0:
-                                    continue
-                        except Exception:
-                            pass
-                        return {"ok": True, "text": tm, "source": "history"}
-                except Exception:
-                    pass
-
-            all_texts = []
-            for _ in range(nav_attempts):
-                try:
-                    collected = await _run_once(client)
-                    if collected:
-                        all_texts = collected  # keep last attempt as most relevant
-                    joined = "\n\n".join([t for t in (collected or []) if (t or '').strip()]).strip()
-
-                    if joined and _looks_useful(joined):
-                        break
-
-                    # If it's just menu/timeout, retry after a short pause
-                    if joined and _looks_like_menu_only(joined):
-                        await asyncio.sleep(0.8)
-
-                except Exception as e:
-                    app.logger.warning(f"DTEK navigation attempt failed: {e}")
-                    await asyncio.sleep(0.5)
-
-            if not all_texts:
-                # Fallback: read a few last messages from history
-                bot = await client.get_entity(DTEK_BOT_USERNAME)
-                msgs = await client.get_messages(bot, limit=25)
-                msgs = list(reversed(msgs))
-                for m in msgs:
+            for step in steps:
+                for cand in _step_variants(step):
                     try:
-                        if since_ts is not None:
-                            dtm = getattr(m, "date", None)
-                            if dtm is not None:
-                                if getattr(dtm, "tzinfo", None) is None:
-                                    import datetime as _dt
-                                    dtm = dtm.replace(tzinfo=_dt.timezone.utc)
-                                if dtm.timestamp() < float(since_ts) - 120.0:
-                                    continue
+                        await client.send_message(bot, cand)
                     except Exception:
                         pass
-                    t = _safe_text(m)
-                    if t:
-                        all_texts.append(t)
+                    await asyncio.sleep(0.9)
 
-            text = "\n\n".join([t for t in all_texts if (t or '').strip()]).strip()
-            return {"ok": True, "text": text}
+            t0 = time.monotonic()
+            while (time.monotonic() - t0) < float(per_msg_timeout):
+                picked = await _pick_latest_outage_text(client)
+                if picked:
+                    return {"ok": True, "text": picked, "source": "poke"}
+                await asyncio.sleep(1.0)
+
+            # 3) Return some tail text to help debugging/parse fallback
+            tail = await _history_tail_text(client)
+            return {"ok": True, "text": tail, "source": "history_tail"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
 
 
 def dtek_get_forecast_cached(force: bool = False) -> dict:
@@ -982,7 +847,7 @@ def dtek_get_forecast_cached(force: bool = False) -> dict:
 
     if not res.get("ok"):
         out["error"] = str(res.get("error") or "unknown error")
-        out["note"] = "DTEK fetch failed"
+        out["note"] = "не вдалося отримати дані від ДТЕК"
         _dtek_cache_save(out)
         return out
 
@@ -1039,7 +904,7 @@ def dtek_get_forecast_since_offline(offline_ts: float | None = None, force: bool
         return out
 
     if not res.get("ok"):
-        out["note"] = (res.get("error") or res.get("note") or "fetch failed")
+        out["note"] = (res.get("error") or res.get("note") or "не вдалося отримати дані від ДТЕК")
         return out
 
     text = (res.get("text") or "").strip()

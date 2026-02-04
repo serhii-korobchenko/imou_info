@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import threading
 import uuid
 import hashlib
 import sqlite3
@@ -145,6 +146,15 @@ DTEK_FETCH_TIMEOUT_SEC = int(os.getenv("DTEK_FETCH_TIMEOUT_SEC", "20"))
 DTEK_FORECAST_CACHE_SEC = int(os.getenv("DTEK_FORECAST_CACHE_SEC", "300"))
 DTEK_ATTACH_TO_OFFLINE_ALERT = env_bool("DTEK_ATTACH_TO_OFFLINE_ALERT", True)
 
+# Send DTEK forecast as a separate message (recommended). If True, we won't append forecast to the OFFLINE alert.
+DTEK_SEND_SEPARATE_MESSAGE = env_bool("DTEK_SEND_SEPARATE_MESSAGE", True)
+# Delay before querying DTEK after OFFLINE (seconds). Default: 5 minutes.
+DTEK_DELAY_AFTER_OFFLINE_SEC = int(os.getenv("DTEK_DELAY_AFTER_OFFLINE_SEC", "300"))
+
+# In-process timers to avoid duplicate delayed fetches per device
+_DTEK_TIMERS = {}
+_DTEK_TIMERS_LOCK = threading.Lock()
+
 
 # Debug: store raw callback payloads into callback_inbox (keep last 200)
 DEBUG_CALLBACK_INBOX = env_bool("DEBUG_CALLBACK_INBOX", False)
@@ -215,6 +225,52 @@ def telegram_send_message(text: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def _run_dtek_forecast_message(device_id: str, device_name: str):
+    """Runs in a background thread (Timer). Fetches DTEK forecast and sends it to the channel as a separate message."""
+    try:
+        fc = dtek_get_forecast_cached(force=True)
+        if not isinstance(fc, dict):
+            return
+        restore = (fc.get("restore_at_kyiv") or "").strip()
+        note = (fc.get("note") or "").strip()
+
+        if restore:
+            msg = f"💡 ДТЕК прогноз відновлення електроенергії ({device_name}): {restore}"
+        elif note:
+            msg = f"💡 ДТЕК ({device_name}): {note}"
+        else:
+            msg = f"💡 ДТЕК ({device_name}): не вдалося отримати прогноз відновлення"
+
+        telegram_send_message(msg)
+    except Exception as e:
+        try:
+            app.logger.warning(f"DTEK delayed forecast failed: {e}")
+        except Exception:
+            pass
+    finally:
+        # clear timer reference
+        try:
+            with _DTEK_TIMERS_LOCK:
+                _DTEK_TIMERS.pop(device_id, None)
+        except Exception:
+            pass
+
+
+def _schedule_dtek_forecast_message(device_id: str, device_name: str):
+    """Schedules DTEK forecast fetch after a delay from OFFLINE event. Deduplicates per device."""
+    delay = max(5, int(DTEK_DELAY_AFTER_OFFLINE_SEC or 300))
+    with _DTEK_TIMERS_LOCK:
+        t = _DTEK_TIMERS.get(device_id)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        timer = threading.Timer(delay, _run_dtek_forecast_message, kwargs={"device_id": device_id, "device_name": device_name})
+        timer.daemon = True
+        _DTEK_TIMERS[device_id] = timer
+        timer.start()
+
 def maybe_notify_telegram_device_status(device_id: str, status: str, interval_note: str = ""):
     """Sends ONLY for the configured parking device, and only for online/offline."""
     st = _normalize_status(status)
@@ -233,7 +289,7 @@ def maybe_notify_telegram_device_status(device_id: str, status: str, interval_no
         text = f"{base}\n{interval_note}"
 
     # Optional: attach DTEK forecast to OFFLINE alerts
-    if st == "offline" and DTEK_ATTACH_TO_OFFLINE_ALERT:
+    if st == "offline" and DTEK_ATTACH_TO_OFFLINE_ALERT and (not DTEK_SEND_SEPARATE_MESSAGE):
         try:
             fc = dtek_get_forecast_cached()
             if isinstance(fc, dict):
@@ -246,7 +302,18 @@ def maybe_notify_telegram_device_status(device_id: str, status: str, interval_no
         except Exception as e:
             app.logger.warning(f"DTEK forecast failed: {e}")
 
+    
     res = telegram_send_message(text)
+
+    # If OFFLINE: schedule a delayed DTEK forecast fetch (separate message) after N seconds.
+    if st == "offline" and DTEK_SEND_SEPARATE_MESSAGE and DTEK_FORECAST_ENABLED:
+        try:
+            _schedule_dtek_forecast_message(
+                device_id=device_id,
+                device_name=get_device_name(device_id) or TELEGRAM_PARKING_DEVICE_NAME,
+            )
+        except Exception as e:
+            app.logger.warning(f"DTEK schedule failed: {e}")
 
     if not res.get("ok"):
         # keep quiet, but log to app logger
@@ -418,13 +485,18 @@ def _dtek_parse_restore_from_text(text: str) -> dict:
     #   "Орієнтовний час відновлення електроенергії: 03.02.2026 21:00."
     # NOTE: This must take priority, because the same message may also contain "Час початку: ...",
     # and a generic date+time regex would otherwise pick the *start* time by accident.
+
+
     for rx in [
         r"(?:орієнтовн\w*\s+час\s+відновлення\s+електроенергії\s*[:\-]?\s*)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\s+(\d{1,2})[:.](\d{2})",
         r"(?:орієнтовн\w*\s+час\s+відновлення\s*[:\-]?\s*)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\s+(\d{1,2})[:.](\d{2})",
         r"(?:очікуван\w*\s+час\s+відновлення\s*(?:електроенергії)?\s*[:\-]?\s*)(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\s+(\d{1,2})[:.](\d{2})",
     ]:
-        m0 = re.search(rx, t_norm, re.IGNORECASE)
-        if m0:
+        # IMPORTANT: DTEK may send two similar blocks in one message (old + updated) separated by a line.
+        # In that case we must parse ONLY the second (latest) one -> take the LAST match.
+        matches = list(re.finditer(rx, t_norm, re.IGNORECASE))
+        if matches:
+            m0 = matches[-1]
             dd, mo, yy, hh, mm = m0.group(1), m0.group(2), m0.group(3), m0.group(4), m0.group(5)
             dd, mo = int(dd), int(mo)
             yy = int(yy) if yy else now_dt.year
@@ -432,7 +504,6 @@ def _dtek_parse_restore_from_text(text: str) -> dict:
                 yy += 2000
             dt = datetime(yy, mo, dd, int(hh), int(mm), tzinfo=KYIV_TZ)
             return {"ok": True, "restore_dt_iso": dt.isoformat(), "restore_at_kyiv": _dtek_format_dt(dt), "note": "", "raw": raw_clip}
-
     # 1) Try any date+time occurrences, but prefer those close to "відновлення/включення" keywords.
     # This avoids accidentally picking the *start* time when both start & restore are present.
     dt_candidates = []

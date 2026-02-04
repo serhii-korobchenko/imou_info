@@ -141,7 +141,7 @@ DTEK_TG_SESSION_FILE = os.getenv("DTEK_TG_SESSION_FILE", os.path.join(DATA_DIR, 
 
 # Menu navigation inside DTEK bot (pipe-separated). Default reflects what DTEK announced publicly.
 # You may need to adjust if DTEK changes labels.
-DTEK_MENU_SEQUENCE = os.getenv("DTEK_MENU_SEQUENCE", "Можливі відключення").strip()
+DTEK_MENU_SEQUENCE = os.getenv("DTEK_MENU_SEQUENCE", "💡 Можливі відключення").strip()
 DTEK_FETCH_TIMEOUT_SEC = int(os.getenv("DTEK_FETCH_TIMEOUT_SEC", "20"))
 DTEK_FORECAST_CACHE_SEC = int(os.getenv("DTEK_FORECAST_CACHE_SEC", "300"))
 DTEK_ATTACH_TO_OFFLINE_ALERT = env_bool("DTEK_ATTACH_TO_OFFLINE_ALERT", True)
@@ -154,6 +154,8 @@ DTEK_DELAY_AFTER_OFFLINE_SEC = int(os.getenv("DTEK_DELAY_AFTER_OFFLINE_SEC", "30
 # In-process timers to avoid duplicate delayed fetches per device
 _DTEK_TIMERS = {}
 _DTEK_TIMERS_LOCK = threading.Lock()
+_DTEK_LAST_OFFLINE = {}
+_DTEK_LAST_OFFLINE_LOCK = threading.Lock()
 
 
 # Debug: store raw callback payloads into callback_inbox (keep last 200)
@@ -225,10 +227,10 @@ def telegram_send_message(text: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def _run_dtek_forecast_message(device_id: str, device_name: str):
+def _run_dtek_forecast_message(device_id: str, device_name: str, offline_ts: float | None = None):
     """Runs in a background thread (Timer). Fetches DTEK forecast and sends it to the channel as a separate message."""
     try:
-        fc = dtek_get_forecast_cached(force=True)
+        fc = dtek_get_forecast_since_offline(offline_ts=offline_ts, force=True)
         if not isinstance(fc, dict):
             return
         restore = (fc.get("restore_at_kyiv") or "").strip()
@@ -256,7 +258,7 @@ def _run_dtek_forecast_message(device_id: str, device_name: str):
             pass
 
 
-def _schedule_dtek_forecast_message(device_id: str, device_name: str):
+def _schedule_dtek_forecast_message(device_id: str, device_name: str, offline_ts: float | None = None):
     """Schedules DTEK forecast fetch after a delay from OFFLINE event. Deduplicates per device."""
     delay = max(5, int(DTEK_DELAY_AFTER_OFFLINE_SEC or 300))
     with _DTEK_TIMERS_LOCK:
@@ -266,7 +268,7 @@ def _schedule_dtek_forecast_message(device_id: str, device_name: str):
                 t.cancel()
             except Exception:
                 pass
-        timer = threading.Timer(delay, _run_dtek_forecast_message, kwargs={"device_id": device_id, "device_name": device_name})
+        timer = threading.Timer(delay, _run_dtek_forecast_message, kwargs={"device_id": device_id, "device_name": device_name, "offline_ts": offline_ts})
         timer.daemon = True
         _DTEK_TIMERS[device_id] = timer
         timer.start()
@@ -308,9 +310,16 @@ def maybe_notify_telegram_device_status(device_id: str, status: str, interval_no
     # If OFFLINE: schedule a delayed DTEK forecast fetch (separate message) after N seconds.
     if st == "offline" and DTEK_SEND_SEPARATE_MESSAGE and DTEK_FORECAST_ENABLED:
         try:
+            offline_ts = time.time()
+            try:
+                with _DTEK_LAST_OFFLINE_LOCK:
+                    _DTEK_LAST_OFFLINE[device_id] = offline_ts
+            except Exception:
+                pass
             _schedule_dtek_forecast_message(
                 device_id=device_id,
                 device_name=get_device_name(device_id) or TELEGRAM_PARKING_DEVICE_NAME,
+                offline_ts=offline_ts,
             )
         except Exception as e:
             app.logger.warning(f"DTEK schedule failed: {e}")
@@ -586,14 +595,15 @@ def _dtek_parse_restore_from_text(text: str) -> dict:
     return {"ok": False, "note": "не вдалося розпізнати прогноз часу включення з відповіді ДТЕК", "raw": raw_clip}
 
 
-async def _dtek_fetch_text_via_telethon() -> dict:
+async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
     """
-    Fetch last DTEK bot responses and try to navigate the menu to reach "Можливі відключення".
+    Fetch DTEK bot responses and navigate the reply-keyboard menu to reach "💡 Можливі відключення".
 
-    Robustness improvements:
-      - DTEK uses a *reply keyboard* (not inline). Telethon may not always expose it via msg.buttons,
-        so we also parse msg.reply_markup.rows to get the exact button text (incl. emojis).
-      - If the bot responds with "Час очікування вичерпано..." and returns to main menu, we retry.
+    Notes:
+      - DTEK uses a *reply keyboard* (not inline). The safest way is to send the exact button text.
+      - Some Telethon builds may not expose reply keyboard buttons reliably, so we also try known variants
+        (with and without emoji) for the target section.
+      - If the bot responds with "Час очікування вичерпано..." and returns to the main menu, we retry.
       - We collect multiple consecutive bot messages because DTEK may send several blocks/messages.
     """
     if not DTEK_FORECAST_ENABLED:
@@ -610,7 +620,7 @@ async def _dtek_fetch_text_via_telethon() -> dict:
         api_id = int(DTEK_TG_API_ID)
     except Exception:
         return {"ok": False, "error": "DTEK_TG_API_ID must be an integer"}
-    api_hash = DTEK_TG_API_HASH
+    api_hash = (DTEK_TG_API_HASH or "").strip()
     if not api_hash:
         return {"ok": False, "error": "DTEK_TG_API_HASH is empty"}
 
@@ -619,16 +629,24 @@ async def _dtek_fetch_text_via_telethon() -> dict:
     # Steps: pipe-separated labels we want to press.
     steps = [s.strip() for s in (DTEK_MENU_SEQUENCE or "").split("|") if s.strip()]
     if not steps:
-        steps = ["Можливі відключення"]
+        steps = ["💡 Можливі відключення"]
 
     # Retry/nav settings
-    nav_attempts = max(1, int(os.getenv("DTEK_NAV_ATTEMPTS", "2")))
-    extra_collect_max = max(2, int(os.getenv("DTEK_EXTRA_COLLECT_MAX", "10")))
-    per_msg_timeout = max(5, int(DTEK_FETCH_TIMEOUT_SEC or 20))
+    nav_attempts = max(1, int(os.getenv("DTEK_NAV_ATTEMPTS", "3")))
+    extra_collect_max = max(2, int(os.getenv("DTEK_EXTRA_COLLECT_MAX", "6")))
+    per_msg_timeout = max(6, int(DTEK_FETCH_TIMEOUT_SEC or 20))
 
     TIMEOUT_PHRASES = ("час очікування вичерпано", "переведено у головне меню")
     MENU_PHRASE = "оберіть потрібний розділ"
-    WANT_HINTS = ("орієнтовний час відновлення", "час початку", "за адресою")
+
+    # Phrases that indicate we reached the section we need (the outage message)
+    WANT_HINTS = (
+        "орієнтовний час відновлення",
+        "час початку",
+        "за адресою",
+        "причина:",
+        "стабілізаційні відключення",
+    )
 
     def _safe_text(m) -> str:
         try:
@@ -639,9 +657,26 @@ async def _dtek_fetch_text_via_telethon() -> dict:
     def _norm(s: str) -> str:
         return " ".join((s or "").split()).casefold()
 
+    def _looks_useful(s: str) -> bool:
+        x = _norm(s)
+        return any(h in x for h in WANT_HINTS)
+
+    def _looks_like_menu_only(s: str) -> bool:
+        x = _norm(s)
+        if not x:
+            return False
+        # Timeout always means we must restart
+        if any(p in x for p in TIMEOUT_PHRASES):
+            return True
+        # Menu phrase alone (without useful content) => still not in target section
+        if (MENU_PHRASE in x) and (not _looks_useful(s)):
+            return True
+        return False
+
     def _extract_button_texts(msg):
+        """Best-effort extraction of reply/inline button texts from Telethon message."""
         out = []
-        # 1) msg.buttons (sometimes only inline)
+        # 1) msg.buttons (often inline)
         btns = getattr(msg, "buttons", None)
         if btns:
             try:
@@ -667,7 +702,7 @@ async def _dtek_fetch_text_via_telethon() -> dict:
                                 out.append(str(t))
                 except Exception:
                     pass
-            # Some Telethon versions expose .keyboard as list of rows
+
             kb = getattr(rm, "keyboard", None)
             if kb:
                 try:
@@ -698,78 +733,110 @@ async def _dtek_fetch_text_via_telethon() -> dict:
                 return t
         return None
 
-    async def _send_step(conv, msg, step: str):
-        """Try click, then send exact button text (incl emoji), then send step text."""
-        btn_text = _match_button_text(msg, step) if msg else None
+    def _step_variants(step: str):
+        """Known label variants (with/without emoji) to improve reliability."""
+        s = " ".join((step or "").split())
+        s_norm = _norm(s)
 
-        # Try to click when supported (inline keyboards)
-        if msg and btn_text:
+        variants = [s]
+
+        # Most important: "Можливі відключення" button often has 💡 prefix
+        if "можливі відключення" in s_norm:
+            variants = [
+                "💡 Можливі відключення",
+                "💡Можливі відключення",
+                "Можливі відключення",
+            ]
+
+        # Some UIs show emoji at the end for "Графік відключень"
+        if "графік відключень" in s_norm:
+            variants = [
+                "Графік відключень🕒",
+                "🕒 Графік відключень",
+                "Графік відключень",
+            ]
+
+        # De-dup
+        out = []
+        seen = set()
+        for v in variants:
+            if v and v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
+
+    async def _collect_followups(conv, collected: list):
+        """Collect several fast follow-up bot messages, if any."""
+        for _ in range(extra_collect_max):
             try:
-                await msg.click(text=btn_text)
-                return btn_text
+                extra = await asyncio.wait_for(conv.get_response(), timeout=1.2)
             except Exception:
-                pass
-
-        # Reply keyboard == just send the exact text
-        try:
-            await conv.send_message(btn_text or step)
-        except Exception:
-            await conv.send_message(step)
-        return btn_text or step
-
-    def _looks_like_menu_or_timeout(s: str) -> bool:
-        x = _norm(s)
-        if not x:
-            return False
-        if MENU_PHRASE in x:
-            return True
-        return any(p in x for p in TIMEOUT_PHRASES)
-
-    def _looks_useful(s: str) -> bool:
-        x = _norm(s)
-        return any(h in x for h in WANT_HINTS)
+                break
+            te = _safe_text(extra)
+            if te:
+                collected.append(te)
 
     async def _run_once(client) -> list:
         bot = await client.get_entity(DTEK_BOT_USERNAME)
         collected = []
 
         async with client.conversation(bot, timeout=per_msg_timeout) as conv:
-            # Reset to known state
             await conv.send_message("/start")
             msg = await conv.get_response()
             t0 = _safe_text(msg)
             if t0:
                 collected.append(t0)
 
-            # Navigate
+            # Navigate steps (usually a single step: "💡 Можливі відключення")
             for step in steps:
-                await _send_step(conv, msg, step)
-                msg = await conv.get_response()
-                t1 = _safe_text(msg)
-                if t1:
-                    collected.append(t1)
+                # Prefer exact button text from keyboard, if we can see it
+                exact = _match_button_text(msg, step) if msg else None
+                candidates = []
+                if exact:
+                    candidates.append(exact)
+                candidates.extend(_step_variants(step))
 
-                # If bot kicked us back to menu/timeout, try sending the step once again
-                if _looks_like_menu_or_timeout(t1):
+                # Try candidates until we leave the menu
+                last_resp = None
+                for cand in candidates:
                     try:
-                        await asyncio.sleep(0.7)
+                        await conv.send_message(cand)
                     except Exception:
-                        pass
-                    await _send_step(conv, msg, step)
-                    msg = await conv.get_response()
-                    t2 = _safe_text(msg)
-                    if t2:
-                        collected.append(t2)
+                        # As a fallback, try click (mainly for inline buttons)
+                        try:
+                            if msg:
+                                await msg.click(text=cand)
+                            else:
+                                raise RuntimeError("no msg to click")
+                        except Exception:
+                            # last resort: plain text
+                            await conv.send_message(str(step))
 
-            # Collect some extra messages quickly (bot may send multiple blocks)
-            for _ in range(extra_collect_max):
-                try:
-                    extra = await asyncio.wait_for(conv.get_response(), timeout=1.2)
-                except Exception:
+                    msg = await conv.get_response()
+                    last_resp = msg
+                    t1 = _safe_text(msg)
+                    if t1:
+                        collected.append(t1)
+
+                    # Collect quick follow-ups (DTEK may send multiple blocks)
+                    await _collect_followups(conv, collected)
+
+                    joined = "\n\n".join([x for x in collected if (x or "").strip()]).strip()
+
+                    # Success: we reached the info section
+                    if joined and _looks_useful(joined):
+                        return collected
+
+                    # Still at menu/timeout -> try next candidate
+                    if _looks_like_menu_only(t1):
+                        continue
+
+                    # Any other non-menu response: accept and move to next step
                     break
-                te = _safe_text(extra)
-                if te:
-                    collected.append(te)
+
+                # If after trying candidates we are still in menu, keep going (outer retry will handle)
+                if last_resp is not None:
+                    msg = last_resp
 
         return collected
 
@@ -781,19 +848,52 @@ async def _dtek_fetch_text_via_telethon() -> dict:
                     "error": "Telethon session is not authorized. Create DTEK_TG_SESSION (StringSession) first.",
                 }
 
+
+
+
+            # 0) Prefer reading the latest outage notification from history.
+            #    In practice, selecting "💡 Можливі відключення" in the menu often just ENABLES notifications,
+            #    and the actual outage message arrives as a separate bot message later.
+            if since_ts is not None:
+                try:
+                    bot = await client.get_entity(DTEK_BOT_USERNAME)
+                    msgs = await client.get_messages(bot, limit=40)
+                    for m in msgs:  # newest first
+                        tm = _safe_text(m)
+                        if not tm:
+                            continue
+                        nm = _norm(tm)
+                        if "орієнтовний час відновлення" not in nm:
+                            continue
+                        try:
+                            dtm = getattr(m, "date", None)
+                            if dtm is not None:
+                                if getattr(dtm, "tzinfo", None) is None:
+                                    import datetime as _dt
+                                    dtm = dtm.replace(tzinfo=_dt.timezone.utc)
+                                if dtm.timestamp() < float(since_ts) - 120.0:
+                                    continue
+                        except Exception:
+                            pass
+                        return {"ok": True, "text": tm, "source": "history"}
+                except Exception:
+                    pass
+
             all_texts = []
             for _ in range(nav_attempts):
                 try:
                     collected = await _run_once(client)
                     if collected:
                         all_texts = collected  # keep last attempt as most relevant
-                    joined = "\n\n".join([t for t in (collected or []) if t.strip()]).strip()
-                    # If we got something useful, stop retrying
-                    if joined and (_looks_useful(joined) or ("орієнтовний час" in _norm(joined))):
+                    joined = "\n\n".join([t for t in (collected or []) if (t or '').strip()]).strip()
+
+                    if joined and _looks_useful(joined):
                         break
-                    # If it's clearly just menu/timeout, retry after a short pause
-                    if joined and _looks_like_menu_or_timeout(joined):
+
+                    # If it's just menu/timeout, retry after a short pause
+                    if joined and _looks_like_menu_only(joined):
                         await asyncio.sleep(0.8)
+
                 except Exception as e:
                     app.logger.warning(f"DTEK navigation attempt failed: {e}")
                     await asyncio.sleep(0.5)
@@ -801,9 +901,20 @@ async def _dtek_fetch_text_via_telethon() -> dict:
             if not all_texts:
                 # Fallback: read a few last messages from history
                 bot = await client.get_entity(DTEK_BOT_USERNAME)
-                msgs = await client.get_messages(bot, limit=12)
+                msgs = await client.get_messages(bot, limit=25)
                 msgs = list(reversed(msgs))
                 for m in msgs:
+                    try:
+                        if since_ts is not None:
+                            dtm = getattr(m, "date", None)
+                            if dtm is not None:
+                                if getattr(dtm, "tzinfo", None) is None:
+                                    import datetime as _dt
+                                    dtm = dtm.replace(tzinfo=_dt.timezone.utc)
+                                if dtm.timestamp() < float(since_ts) - 120.0:
+                                    continue
+                    except Exception:
+                        pass
                     t = _safe_text(m)
                     if t:
                         all_texts.append(t)
@@ -812,6 +923,7 @@ async def _dtek_fetch_text_via_telethon() -> dict:
             return {"ok": True, "text": text}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
 
 
 def dtek_get_forecast_cached(force: bool = False) -> dict:
@@ -872,6 +984,70 @@ def dtek_get_forecast_cached(force: bool = False) -> dict:
     out["ts_epoch"] = now_ts
     out["ts_kyiv"] = now_kyiv_iso()
     _dtek_cache_save(out)
+    return out
+
+
+
+def dtek_get_forecast_since_offline(offline_ts: float | None = None, force: bool = True) -> dict:
+    """
+    Fetch + parse forecast for a specific OFFLINE event.
+    - Wait logic is handled elsewhere (Timer).
+    - We prefer the newest outage notification message since offline_ts.
+    - We bypass the generic 300s cache because we need the latest data for this outage event.
+    """
+    ok, reason = _dtek_feature_ready()
+    if not ok:
+        return {"ok": False, "note": reason}
+
+    now_ts = time.time()
+
+    # Always fetch (best-effort) because this is used for the delayed OFFLINE notification.
+    try:
+        res = asyncio.run(asyncio.wait_for(_dtek_fetch_text_via_telethon(since_ts=offline_ts), timeout=max(8, DTEK_FETCH_TIMEOUT_SEC)))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_text_via_telethon(since_ts=offline_ts), timeout=max(8, DTEK_FETCH_TIMEOUT_SEC)))
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+    except Exception as e:
+        res = {"ok": False, "error": str(e)}
+
+    out = {
+        "ok": False,
+        "ts_epoch": now_ts,
+        "ts_kyiv": now_kyiv_iso(),
+        "restore_dt_iso": None,
+        "restore_at_kyiv": None,
+        "note": "",
+        "raw": "",
+    }
+
+    if not isinstance(res, dict):
+        out["note"] = "unexpected response"
+        return out
+
+    if not res.get("ok"):
+        out["note"] = (res.get("error") or res.get("note") or "fetch failed")
+        return out
+
+    text = (res.get("text") or "").strip()
+    parsed = _dtek_parse_restore_from_text(text)
+    if isinstance(parsed, dict):
+        out.update({
+            "ok": bool(parsed.get("ok")),
+            "restore_dt_iso": parsed.get("restore_dt_iso"),
+            "restore_at_kyiv": parsed.get("restore_at_kyiv"),
+            "note": parsed.get("note") or "",
+            "raw": parsed.get("raw") or text[:4000],
+        })
+    else:
+        out["note"] = "parse failed"
+        out["raw"] = text[:4000]
+
     return out
 
 def upsert_device(device_id: str, **fields):

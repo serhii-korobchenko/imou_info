@@ -19,6 +19,10 @@ from flask import Flask, request, jsonify, abort, render_template_string
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+# HTTP timeout for Google APIs (httplib2)
+import httplib2
+from google_auth_httplib2 import AuthorizedHttp
+
 
 # -----------------------------
 # Helpers
@@ -184,6 +188,10 @@ GDRIVE_EVENTS_TAB_NAME = os.getenv("GDRIVE_EVENTS_TAB_NAME", "Events").strip()
 GDRIVE_EVENTS_APPEND_BATCH = int(os.getenv("GDRIVE_EVENTS_APPEND_BATCH", "50"))
 GDRIVE_FLUSH_INTERVAL_SEC = int(os.getenv("GDRIVE_FLUSH_INTERVAL_SEC", "5"))
 GDRIVE_EVENTS_ENABLED = env_bool("GDRIVE_EVENTS_ENABLED", True)
+# Google API HTTP timeout (seconds) to avoid hanging requests
+GDRIVE_HTTP_TIMEOUT_SEC = int(os.getenv("GDRIVE_HTTP_TIMEOUT_SEC", "20"))
+# Avoid blocking IMOU webhook handler on Google Sheets network calls
+GDRIVE_ASYNC_FLUSH_ON_CALLBACK = env_bool("GDRIVE_ASYNC_FLUSH_ON_CALLBACK", True)
 
 # -----------------------------
 # Flask
@@ -1209,6 +1217,9 @@ _sheets_service = None
 
 _last_flush_ts = 0.0
 
+_sheets_flush_lock = threading.Lock()
+_sheets_flush_in_progress = False
+
 
 def google_enabled() -> bool:
     return GDRIVE_EVENTS_ENABLED and bool(GDRIVE_SA_JSON_B64)
@@ -1222,7 +1233,8 @@ def get_drive_service():
         raise RuntimeError("Missing GDRIVE_SA_JSON_B64")
     sa_info = json.loads(base64.b64decode(GDRIVE_SA_JSON_B64).decode("utf-8"))
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=DRIVE_SCOPES)
-    _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    _drive_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=GDRIVE_HTTP_TIMEOUT_SEC))
+    _drive_service = build("drive", "v3", http=_drive_http, cache_discovery=False)
     return _drive_service
 
 
@@ -1234,7 +1246,8 @@ def get_sheets_service():
         raise RuntimeError("Missing GDRIVE_SA_JSON_B64")
     sa_info = json.loads(base64.b64decode(GDRIVE_SA_JSON_B64).decode("utf-8"))
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=DRIVE_SCOPES)
-    _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    _sheets_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=GDRIVE_HTTP_TIMEOUT_SEC))
+    _sheets_service = build("sheets", "v4", http=_sheets_http, cache_discovery=False)
     return _sheets_service
 
 
@@ -1495,7 +1508,51 @@ def flush_sheets(max_rows: int | None = None) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+
+def _start_background_sheets_flush(limit: int) -> bool:
+    """Start a background flush to Google Sheets (non-blocking for webhook request)."""
+    global _sheets_flush_in_progress
+    if not google_enabled():
+        return False
+
+    # One flush at a time
+    if _sheets_flush_in_progress:
+        return False
+    if not _sheets_flush_lock.acquire(False):
+        return False
+
+    _sheets_flush_in_progress = True
+
+    def _worker():
+        global _sheets_flush_in_progress
+        try:
+            res = flush_sheets(limit)
+            if not res.get("ok"):
+                app.logger.warning(f"Google Sheets flush failed (async): {res}")
+        except Exception as e:
+            try:
+                app.logger.warning(f"Google Sheets flush failed (async): {e}")
+            except Exception:
+                pass
+        finally:
+            _sheets_flush_in_progress = False
+            try:
+                _sheets_flush_lock.release()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_worker, daemon=True, name="gsheets-flush")
+    t.start()
+    return True
+
+
+
 def maybe_flush_sheets():
+    """Throttled flush of queued rows to Google Sheets.
+
+    IMPORTANT: In production (Railway + gunicorn), we run this flush asynchronously by default
+    to avoid blocking the IMOU webhook handler and triggering worker timeouts.
+    """
     global _last_flush_ts
     if not google_enabled():
         return
@@ -1506,15 +1563,20 @@ def maybe_flush_sheets():
         return
 
     st = sheets_queue_stats()
-    # flush if we have any unsent
     if st["unsent"] <= 0:
         _last_flush_ts = now_ts
         return
 
-    res = flush_sheets(GDRIVE_EVENTS_APPEND_BATCH)
+    limit = GDRIVE_EVENTS_APPEND_BATCH
+
+    if GDRIVE_ASYNC_FLUSH_ON_CALLBACK:
+        _start_background_sheets_flush(limit)
+        _last_flush_ts = now_ts
+        return
+
+    res = flush_sheets(limit)
     _last_flush_ts = now_ts
     if not res.get("ok"):
-        # keep quiet, but log to app logger
         app.logger.warning(f"Google Sheets flush failed: {res}")
 
 

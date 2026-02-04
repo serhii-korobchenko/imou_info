@@ -588,14 +588,13 @@ def _dtek_parse_restore_from_text(text: str) -> dict:
 
 async def _dtek_fetch_text_via_telethon() -> dict:
     """
-    Fetch last DTEK bot responses and try to navigate the menu to reach the outage schedule.
+    Fetch last DTEK bot responses and try to navigate the menu to reach "Можливі відключення".
 
-    Notes:
-      - DTEK bot menu in your screenshot is a *reply keyboard* (not inline).
-        In practice, pressing such buttons == sending the exact button text.
-      - We try both:
-          (a) click button from reply_markup when present (more robust for emojis),
-          (b) send text fallback.
+    Robustness improvements:
+      - DTEK uses a *reply keyboard* (not inline). Telethon may not always expose it via msg.buttons,
+        so we also parse msg.reply_markup.rows to get the exact button text (incl. emojis).
+      - If the bot responds with "Час очікування вичерпано..." and returns to main menu, we retry.
+      - We collect multiple consecutive bot messages because DTEK may send several blocks/messages.
     """
     if not DTEK_FORECAST_ENABLED:
         return {"ok": False, "error": "DTEK_FORECAST_ENABLED is disabled"}
@@ -617,34 +616,162 @@ async def _dtek_fetch_text_via_telethon() -> dict:
 
     session = StringSession(DTEK_TG_SESSION) if DTEK_TG_SESSION else DTEK_TG_SESSION_FILE
 
-    # Steps: pipe-separated labels we want to press. For your menu:
-    #   "Можливі відключення"
-    # (If you want the schedule image instead, use "Графік відключень".)
+    # Steps: pipe-separated labels we want to press.
     steps = [s.strip() for s in (DTEK_MENU_SEQUENCE or "").split("|") if s.strip()]
+    if not steps:
+        steps = ["Можливі відключення"]
 
-    def _iter_button_texts(msg):
-        out = []
-        btns = getattr(msg, "buttons", None)
-        if not btns:
-            return out
+    # Retry/nav settings
+    nav_attempts = max(1, int(os.getenv("DTEK_NAV_ATTEMPTS", "2")))
+    extra_collect_max = max(2, int(os.getenv("DTEK_EXTRA_COLLECT_MAX", "10")))
+    per_msg_timeout = max(5, int(DTEK_FETCH_TIMEOUT_SEC or 20))
+
+    TIMEOUT_PHRASES = ("час очікування вичерпано", "переведено у головне меню")
+    MENU_PHRASE = "оберіть потрібний розділ"
+    WANT_HINTS = ("орієнтовний час відновлення", "час початку", "за адресою")
+
+    def _safe_text(m) -> str:
         try:
-            for row in btns:
-                for b in row:
-                    t = getattr(b, "text", None)
-                    if t:
-                        out.append(str(t))
+            return (m.raw_text or m.message or "").strip()
         except Exception:
-            pass
-        return out
+            return ""
 
-    def _match_button(msg, needle: str):
-        n = (needle or "").strip().casefold()
+    def _norm(s: str) -> str:
+        return " ".join((s or "").split()).casefold()
+
+    def _extract_button_texts(msg):
+        out = []
+        # 1) msg.buttons (sometimes only inline)
+        btns = getattr(msg, "buttons", None)
+        if btns:
+            try:
+                for row in btns:
+                    for b in row:
+                        t = getattr(b, "text", None)
+                        if t:
+                            out.append(str(t))
+            except Exception:
+                pass
+
+        # 2) reply_markup.rows (reply keyboard)
+        rm = getattr(msg, "reply_markup", None)
+        if rm:
+            rows = getattr(rm, "rows", None)
+            if rows:
+                try:
+                    for r in rows:
+                        bs = getattr(r, "buttons", None) or []
+                        for b in bs:
+                            t = getattr(b, "text", None)
+                            if t:
+                                out.append(str(t))
+                except Exception:
+                    pass
+            # Some Telethon versions expose .keyboard as list of rows
+            kb = getattr(rm, "keyboard", None)
+            if kb:
+                try:
+                    for r in kb:
+                        bs = getattr(r, "buttons", None) or r
+                        for b in bs:
+                            t = getattr(b, "text", None)
+                            if t:
+                                out.append(str(t))
+                except Exception:
+                    pass
+
+        # De-dup while preserving order
+        seen = set()
+        uniq = []
+        for t in out:
+            if t not in seen:
+                seen.add(t)
+                uniq.append(t)
+        return uniq
+
+    def _match_button_text(msg, needle: str):
+        n = _norm(needle)
         if not n:
             return None
-        for t in _iter_button_texts(msg):
-            if n in t.casefold():
+        for t in _extract_button_texts(msg):
+            if n in _norm(t):
                 return t
         return None
+
+    async def _send_step(conv, msg, step: str):
+        """Try click, then send exact button text (incl emoji), then send step text."""
+        btn_text = _match_button_text(msg, step) if msg else None
+
+        # Try to click when supported (inline keyboards)
+        if msg and btn_text:
+            try:
+                await msg.click(text=btn_text)
+                return btn_text
+            except Exception:
+                pass
+
+        # Reply keyboard == just send the exact text
+        try:
+            await conv.send_message(btn_text or step)
+        except Exception:
+            await conv.send_message(step)
+        return btn_text or step
+
+    def _looks_like_menu_or_timeout(s: str) -> bool:
+        x = _norm(s)
+        if not x:
+            return False
+        if MENU_PHRASE in x:
+            return True
+        return any(p in x for p in TIMEOUT_PHRASES)
+
+    def _looks_useful(s: str) -> bool:
+        x = _norm(s)
+        return any(h in x for h in WANT_HINTS)
+
+    async def _run_once(client) -> list:
+        bot = await client.get_entity(DTEK_BOT_USERNAME)
+        collected = []
+
+        async with client.conversation(bot, timeout=per_msg_timeout) as conv:
+            # Reset to known state
+            await conv.send_message("/start")
+            msg = await conv.get_response()
+            t0 = _safe_text(msg)
+            if t0:
+                collected.append(t0)
+
+            # Navigate
+            for step in steps:
+                await _send_step(conv, msg, step)
+                msg = await conv.get_response()
+                t1 = _safe_text(msg)
+                if t1:
+                    collected.append(t1)
+
+                # If bot kicked us back to menu/timeout, try sending the step once again
+                if _looks_like_menu_or_timeout(t1):
+                    try:
+                        await asyncio.sleep(0.7)
+                    except Exception:
+                        pass
+                    await _send_step(conv, msg, step)
+                    msg = await conv.get_response()
+                    t2 = _safe_text(msg)
+                    if t2:
+                        collected.append(t2)
+
+            # Collect some extra messages quickly (bot may send multiple blocks)
+            for _ in range(extra_collect_max):
+                try:
+                    extra = await asyncio.wait_for(conv.get_response(), timeout=1.2)
+                except Exception:
+                    break
+                te = _safe_text(extra)
+                if te:
+                    collected.append(te)
+
+        return collected
 
     try:
         async with TelegramClient(session, api_id, api_hash) as client:
@@ -654,61 +781,34 @@ async def _dtek_fetch_text_via_telethon() -> dict:
                     "error": "Telethon session is not authorized. Create DTEK_TG_SESSION (StringSession) first.",
                 }
 
-            bot = await client.get_entity(DTEK_BOT_USERNAME)
+            all_texts = []
+            for _ in range(nav_attempts):
+                try:
+                    collected = await _run_once(client)
+                    if collected:
+                        all_texts = collected  # keep last attempt as most relevant
+                    joined = "\n\n".join([t for t in (collected or []) if t.strip()]).strip()
+                    # If we got something useful, stop retrying
+                    if joined and (_looks_useful(joined) or ("орієнтовний час" in _norm(joined))):
+                        break
+                    # If it's clearly just menu/timeout, retry after a short pause
+                    if joined and _looks_like_menu_or_timeout(joined):
+                        await asyncio.sleep(0.8)
+                except Exception as e:
+                    app.logger.warning(f"DTEK navigation attempt failed: {e}")
+                    await asyncio.sleep(0.5)
 
-            collected_texts = []
-
-            # Conversation-based navigation (best-effort)
-            try:
-                async with client.conversation(bot, timeout=max(5, DTEK_FETCH_TIMEOUT_SEC)) as conv:
-                    # Kick-start the bot to ensure keyboard is present.
-                    await conv.send_message("/start")
-                    msg = await conv.get_response()
-                    if msg and (msg.raw_text or msg.message):
-                        collected_texts.append(msg.raw_text or msg.message or "")
-
-                    for step in steps:
-                        # Try to press an on-screen button by substring match
-                        btn_text = _match_button(msg, step) if msg else None
-
-                        pressed = False
-                        if msg and btn_text:
-                            # Try true "click" first (works for inline keyboards too)
-                            try:
-                                await msg.click(text=btn_text)
-                                pressed = True
-                            except Exception:
-                                pressed = False
-
-                        if not pressed:
-                            # Reply-keyboard fallback: send exact text (prefer matched button text if present)
-                            await conv.send_message(btn_text or step)
-
-                        # Wait for bot response and keep as current message (for next step keyboard)
-                        msg = await conv.get_response()
-                        if msg and (msg.raw_text or msg.message):
-                            collected_texts.append(msg.raw_text or msg.message or "")
-
-                    # Some bots send multiple messages; collect a few extra quickly
-                    for _ in range(4):
-                        try:
-                            extra = await asyncio.wait_for(conv.get_response(), timeout=1.5)
-                        except Exception:
-                            break
-                        if extra and (extra.raw_text or extra.message):
-                            collected_texts.append(extra.raw_text or extra.message or "")
-            except Exception as e:
-                app.logger.warning(f"DTEK conversation flow failed, fallback to history: {e}")
-
-            if not collected_texts:
+            if not all_texts:
                 # Fallback: read a few last messages from history
-                msgs = await client.get_messages(bot, limit=10)
+                bot = await client.get_entity(DTEK_BOT_USERNAME)
+                msgs = await client.get_messages(bot, limit=12)
                 msgs = list(reversed(msgs))
                 for m in msgs:
-                    if m and (m.raw_text or m.message):
-                        collected_texts.append(m.raw_text or m.message or "")
+                    t = _safe_text(m)
+                    if t:
+                        all_texts.append(t)
 
-            text = "\n\n".join([t for t in collected_texts if (t or '').strip()]).strip()
+            text = "\n\n".join([t for t in all_texts if (t or '').strip()]).strip()
             return {"ok": True, "text": text}
     except Exception as e:
         return {"ok": False, "error": str(e)}

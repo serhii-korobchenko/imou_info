@@ -155,11 +155,27 @@ DTEK_SEND_SEPARATE_MESSAGE = env_bool("DTEK_SEND_SEPARATE_MESSAGE", True)
 # Delay before querying DTEK after OFFLINE (seconds). Default: 5 minutes.
 DTEK_DELAY_AFTER_OFFLINE_SEC = int(os.getenv("DTEK_DELAY_AFTER_OFFLINE_SEC", "300"))
 
+# Send DTEK outage schedule graph (jpg) after power restore (ONLINE) as a separate Telegram photo message
+DTEK_SEND_GRAPH_ON_RESTORE = env_bool("DTEK_SEND_GRAPH_ON_RESTORE", True)
+# Navigation path (pipe-separated) to reach outage schedule graphs inside DTEK bot.
+# User requested: Menu/Графік відключень🕒 then take the second graph from the message/album.
+DTEK_GRAPH_SEQUENCE = os.getenv("DTEK_GRAPH_SEQUENCE", "Меню|Графік відключень🕒").strip()
+# Small delay after ONLINE message before sending the graph (seconds), to keep message order stable.
+DTEK_GRAPH_SEND_DELAY_SEC = int(os.getenv("DTEK_GRAPH_SEND_DELAY_SEC", "2"))
+# Deduplication window for sending graphs on restore (seconds) to avoid spamming on flapping.
+DTEK_GRAPH_CACHE_SEC = int(os.getenv("DTEK_GRAPH_CACHE_SEC", "600"))
+
 # In-process timers to avoid duplicate delayed fetches per device
 _DTEK_TIMERS = {}
 _DTEK_TIMERS_LOCK = threading.Lock()
 _DTEK_LAST_OFFLINE = {}
 _DTEK_LAST_OFFLINE_LOCK = threading.Lock()
+
+# In-process timers and dedup for sending DTEK schedule graph after power restore
+_DTEK_GRAPH_TIMERS = {}
+_DTEK_GRAPH_TIMERS_LOCK = threading.Lock()
+_DTEK_LAST_GRAPH_SENT = {}
+_DTEK_LAST_GRAPH_SENT_LOCK = threading.Lock()
 
 
 # Debug: store raw callback payloads into callback_inbox (keep last 200)
@@ -235,6 +251,29 @@ def telegram_send_message(text: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def telegram_send_photo(photo_path: str, caption: str = "") -> dict:
+    """Send a photo (jpg/png) to Telegram channel/chat. Never raises (best-effort)."""
+    if not telegram_enabled():
+        return {"ok": False, "reason": "telegram disabled or missing env"}
+    if not photo_path or not os.path.exists(photo_path):
+        return {"ok": False, "reason": "photo not found", "path": photo_path}
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        data = {"chat_id": TELEGRAM_CHAT_ID}
+        if caption:
+            data["caption"] = caption
+        with open(photo_path, "rb") as f:
+            files = {"photo": f}
+            r = requests.post(url, data=data, files=files, timeout=max(10, int(TELEGRAM_TIMEOUT_SEC or 10)))
+        if r.status_code >= 400:
+            return {"ok": False, "status": r.status_code, "error": r.text[:500]}
+        data_json = r.json()
+        return data_json if isinstance(data_json, dict) else {"ok": True, "raw": data_json}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+
 def _run_dtek_forecast_message(device_id: str, device_name: str, offline_ts: float | None = None):
     """Runs in a background thread (Timer). Fetches DTEK forecast and sends it to the channel as a separate message."""
     try:
@@ -298,6 +337,58 @@ def _schedule_dtek_forecast_message(device_id: str, device_name: str, offline_ts
         _DTEK_TIMERS[device_id] = timer
         timer.start()
 
+
+def _run_dtek_graph_message(device_id: str, device_name: str):
+    """Runs in a background thread (Timer). Fetches DTEK schedule graph (second) and sends it as a photo."""
+    try:
+        now_ts = time.time()
+        with _DTEK_LAST_GRAPH_SENT_LOCK:
+            last_ts = float(_DTEK_LAST_GRAPH_SENT.get(device_id) or 0.0)
+            if last_ts and (now_ts - last_ts) < max(60, int(DTEK_GRAPH_CACHE_SEC or 600)):
+                return
+
+        res = dtek_get_schedule_graph_second(force=True)
+        if isinstance(res, dict) and res.get("ok") and res.get("path"):
+            caption = f"📈 ДТЕК графік відключень ({device_name})"
+            telegram_send_photo(res["path"], caption=caption)
+            with _DTEK_LAST_GRAPH_SENT_LOCK:
+                _DTEK_LAST_GRAPH_SENT[device_id] = now_ts
+        else:
+            try:
+                app.logger.warning(f"DTEK graph fetch failed: {res}")
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            app.logger.warning(f"DTEK graph message failed: {e}")
+        except Exception:
+            pass
+    finally:
+        try:
+            with _DTEK_GRAPH_TIMERS_LOCK:
+                _DTEK_GRAPH_TIMERS.pop(device_id, None)
+        except Exception:
+            pass
+
+
+def _schedule_dtek_graph_on_restore(device_id: str, device_name: str):
+    """Schedules sending DTEK schedule graph shortly after ONLINE event. Deduplicates per device."""
+    if not (DTEK_FORECAST_ENABLED and DTEK_SEND_GRAPH_ON_RESTORE):
+        return
+    delay = max(0, int(DTEK_GRAPH_SEND_DELAY_SEC or 2))
+    with _DTEK_GRAPH_TIMERS_LOCK:
+        t = _DTEK_GRAPH_TIMERS.get(device_id)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        timer = threading.Timer(delay, _run_dtek_graph_message, kwargs={"device_id": device_id, "device_name": device_name})
+        timer.daemon = True
+        _DTEK_GRAPH_TIMERS[device_id] = timer
+        timer.start()
+
+
 def maybe_notify_telegram_device_status(device_id: str, status: str, interval_note: str = ""):
     """Sends ONLY for the configured parking device, and only for online/offline."""
     st = _normalize_status(status)
@@ -331,6 +422,15 @@ def maybe_notify_telegram_device_status(device_id: str, status: str, interval_no
 
     
     res = telegram_send_message(text)
+    # If ONLINE (power restored): send DTEK outage schedule graph (second image) as a separate photo message.
+    if st == "online" and DTEK_FORECAST_ENABLED and DTEK_SEND_GRAPH_ON_RESTORE:
+        try:
+            _schedule_dtek_graph_on_restore(
+                device_id=device_id,
+                device_name=get_device_name(device_id) or TELEGRAM_PARKING_DEVICE_NAME,
+            )
+        except Exception as e:
+            app.logger.warning(f"DTEK graph schedule failed: {e}")
 
     # If OFFLINE: schedule a delayed DTEK forecast fetch (separate message) after N seconds.
     if st == "offline" and DTEK_SEND_SEPARATE_MESSAGE and DTEK_FORECAST_ENABLED:
@@ -922,6 +1022,207 @@ def dtek_get_forecast_since_offline(offline_ts: float | None = None, force: bool
         out["raw"] = text[:4000]
 
     return out
+
+
+# -----------------------------
+# DTEK: fetch outage schedule graph (jpg) on power restore
+# -----------------------------
+def dtek_get_schedule_graph_second(force: bool = True) -> dict:
+    """
+    Fetch DTEK outage schedule graphs via Telethon (user session) and return path to the SECOND image.
+    Path: Меню/Графік відключень🕒 -> take the second graph from the message/album.
+    Returns: {ok: bool, path: str|None, note: str, raw: str}
+    """
+    ok, reason = _dtek_feature_ready()
+    if not ok:
+        return {"ok": False, "path": None, "note": reason, "raw": ""}
+
+    try:
+        res = asyncio.run(asyncio.wait_for(_dtek_fetch_graph_via_telethon(), timeout=max(10, DTEK_FETCH_TIMEOUT_SEC)))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_graph_via_telethon(), timeout=max(10, DTEK_FETCH_TIMEOUT_SEC)))
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+    except Exception as e:
+        return {"ok": False, "path": None, "note": f"fetch error: {e}", "raw": ""}
+
+    if not isinstance(res, dict) or not res.get("ok"):
+        note = "fetch failed"
+        raw = ""
+        if isinstance(res, dict):
+            note = (res.get("note") or note)
+            raw = (res.get("raw") or raw)
+        return {"ok": False, "path": None, "note": note, "raw": raw}
+
+    return res
+
+
+async def _dtek_fetch_graph_via_telethon() -> dict:
+    api_id = int(DTEK_TG_API_ID)
+    api_hash = str(DTEK_TG_API_HASH)
+
+    # session
+    if DTEK_TG_SESSION:
+        session = StringSession(DTEK_TG_SESSION)
+    else:
+        os.makedirs(os.path.dirname(DTEK_TG_SESSION_FILE), exist_ok=True)
+        session = DTEK_TG_SESSION_FILE
+
+    # Steps
+    steps = []
+    for s in (DTEK_GRAPH_SEQUENCE or "").split("|"):
+        s = (s or "").strip()
+        if s:
+            steps.append(s)
+    if not steps:
+        steps = ["Меню", "Графік відключень🕒"]
+
+    def _norm(s: str) -> str:
+        return (s or "").strip().casefold()
+
+    def _best_variant(step: str) -> str:
+        n = _norm(step)
+        if "меню" in n:
+            return "Меню"
+        if "графік" in n:
+            return "Графік відключень🕒"
+        return step
+
+    def _msg_ts(m) -> float | None:
+        try:
+            if getattr(m, "date", None):
+                return float(m.date.replace(tzinfo=timezone.utc).timestamp())
+        except Exception:
+            pass
+        return None
+
+    def _is_image_message(m) -> bool:
+        try:
+            if getattr(m, "photo", None) is not None:
+                return True
+        except Exception:
+            pass
+        try:
+            mt = getattr(getattr(m, "file", None), "mime_type", None) or ""
+            if isinstance(mt, str) and mt.startswith("image/"):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _pick_second_image(msgs):
+        imgs = []
+        for m in msgs:
+            try:
+                if getattr(m, "out", False):
+                    continue
+            except Exception:
+                pass
+            if _is_image_message(m):
+                imgs.append(m)
+
+        if not imgs:
+            return None
+
+        # Prefer albums
+        groups = {}
+        for m in imgs:
+            gid = getattr(m, "grouped_id", None)
+            if gid:
+                groups.setdefault(gid, []).append(m)
+
+        if groups:
+            def group_key(gid):
+                mx = 0.0
+                for mm in groups[gid]:
+                    mx = max(mx, _msg_ts(mm) or 0.0)
+                return mx
+
+            best_gid = max(groups.keys(), key=group_key)
+            group = sorted(groups[best_gid], key=lambda mm: _msg_ts(mm) or 0.0)
+            if len(group) >= 2:
+                return group[1]
+            return group[-1]
+
+        imgs_sorted = sorted(imgs, key=lambda mm: _msg_ts(mm) or 0.0)
+        return imgs_sorted[1] if len(imgs_sorted) >= 2 else imgs_sorted[0]
+
+    def _make_client():
+        try:
+            return TelegramClient(session, api_id, api_hash, receive_updates=False)
+        except TypeError:
+            return TelegramClient(session, api_id, api_hash)
+
+    async with _make_client() as client:
+        if not await client.is_user_authorized():
+            return {"ok": False, "path": None, "note": "Telethon session is not authorized", "raw": ""}
+
+        bot = await client.get_entity(DTEK_BOT_USERNAME)
+
+        baseline_id = 0
+        try:
+            last = await client.get_messages(bot, limit=1)
+            if last:
+                baseline_id = int(last[0].id or 0)
+        except Exception:
+            baseline_id = 0
+
+        # Reset and navigate
+        try:
+            await client.send_message(bot, "/start")
+        except Exception:
+            pass
+        await asyncio.sleep(0.8)
+
+        for step in steps:
+            try:
+                await client.send_message(bot, _best_variant(step))
+            except Exception:
+                try:
+                    await client.send_message(bot, step)
+                except Exception:
+                    pass
+            await asyncio.sleep(1.1)
+
+        # Poll for new images
+        t0 = time.monotonic()
+        while (time.monotonic() - t0) < float(DTEK_FETCH_TIMEOUT_SEC or 20):
+            try:
+                msgs = await client.get_messages(bot, limit=30)
+                new_msgs = [m for m in msgs if int(getattr(m, "id", 0) or 0) > baseline_id]
+                chosen = _pick_second_image(new_msgs)
+                if chosen:
+                    os.makedirs("/tmp", exist_ok=True)
+                    prefix = os.path.join("/tmp", f"dtek_graph_{int(time.time())}_")
+                    path = await client.download_media(chosen, file=prefix)
+                    if not path:
+                        return {"ok": False, "path": None, "note": "download failed", "raw": ""}
+                    final_path = path
+                    # Optional conversion to JPG (if Pillow installed)
+                    try:
+                        if not str(final_path).lower().endswith((".jpg", ".jpeg")):
+                            from PIL import Image  # type: ignore
+                            img = Image.open(final_path).convert("RGB")
+                            jpg_path = os.path.splitext(final_path)[0] + ".jpg"
+                            img.save(jpg_path, format="JPEG", quality=95)
+                            final_path = jpg_path
+                    except Exception:
+                        final_path = path
+                    return {"ok": True, "path": final_path, "note": "", "raw": f"picked_id={getattr(chosen,'id',None)} baseline_id={baseline_id}"}
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+        return {"ok": False, "path": None, "note": "no image received", "raw": ""}
+
+
+
+
 
 def upsert_device(device_id: str, **fields):
     keys = []

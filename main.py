@@ -1063,6 +1063,13 @@ def dtek_get_schedule_graph_second(force: bool = True) -> dict:
 
 
 async def _dtek_fetch_graph_via_telethon() -> dict:
+    # Import here to avoid hard dependency if feature disabled
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+    except Exception as e:
+        return {"ok": False, "path": None, "note": f"telethon import failed: {e}", "raw": ""}
+
     api_id = int(DTEK_TG_API_ID)
     api_hash = str(DTEK_TG_API_HASH)
 

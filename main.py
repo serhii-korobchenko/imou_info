@@ -124,6 +124,10 @@ TELEGRAM_TIMEOUT_SEC = int(os.getenv("TELEGRAM_TIMEOUT_SEC", "10"))
 TELEGRAM_PARKING_DEVICE_ID = os.getenv("TELEGRAM_PARKING_DEVICE_ID", "14062AEPBV3882A").strip()
 TELEGRAM_PARKING_DEVICE_NAME = os.getenv("TELEGRAM_PARKING_DEVICE_NAME", "Парковка").strip()
 
+# Default: device used for Internet availability charts (Events sheet: msg_type online/offline)
+INTERNET_DEVICE_ID = os.getenv("INTERNET_DEVICE_ID", "A683BBHPSFD935E").strip()
+INTERNET_DEVICE_NAME = os.getenv("INTERNET_DEVICE_NAME", "Коридор").strip()
+
 
 # -----------------------------
 # DTEK forecast (optional)
@@ -2891,6 +2895,278 @@ def api_charts_power_daily():
     return jsonify(data)
 
 
+# -----------------------------
+# Charts: Internet availability (Corridor / configured device)
+# -----------------------------
+def compute_internet_ratio_from_gsheets():
+    """Compute total ONLINE vs OFFLINE hours for the Internet chart device, based on status changes in Events sheet."""
+    device_id = (INTERNET_DEVICE_ID or '').strip()
+    device_name = (INTERNET_DEVICE_NAME or 'Коридор').strip()
+
+    if not google_enabled():
+        return {
+            'ok': False,
+            'error': 'Google is disabled (missing GDRIVE_SA_JSON_B64)',
+            'device_id': device_id,
+            'device_name': device_name,
+            'online_hours': 0.0,
+            'offline_hours': 0.0,
+            'total_hours': 0.0,
+            'range_from': None,
+            'range_to': None,
+            'source': 'gsheets',
+        }
+
+    try:
+        sid = ensure_events_spreadsheet_id()
+        sheets = get_sheets_service()
+
+        rng = f"{GDRIVE_EVENTS_TAB_NAME}!A:E"
+        values = sheets.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get('values', [])
+        if not values or len(values) < 2:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'online_hours': 0.0,
+                'offline_hours': 0.0,
+                'total_hours': 0.0,
+                'range_from': None,
+                'range_to': None,
+                'source': 'gsheets',
+            }
+
+        header = values[0]
+        i_time, i_dev, i_type = 0, 2, 4
+        try:
+            if isinstance(header, list) and header:
+                if 'received_at_kyiv' in header:
+                    i_time = header.index('received_at_kyiv')
+                elif 'received_at_utc' in header:
+                    i_time = header.index('received_at_utc')
+                if 'device_id' in header:
+                    i_dev = header.index('device_id')
+                if 'msg_type' in header:
+                    i_type = header.index('msg_type')
+        except Exception:
+            pass
+
+        events = _extract_status_events(values, device_id=device_id, i_time=i_time, i_dev=i_dev, i_type=i_type)
+        if not events:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'online_hours': 0.0,
+                'offline_hours': 0.0,
+                'total_hours': 0.0,
+                'range_from': None,
+                'range_to': None,
+                'source': 'gsheets',
+            }
+
+        online_sec = 0
+        offline_sec = 0
+
+        last_dt, last_st = events[0]
+        range_from = last_dt
+
+        for dt, st in events[1:]:
+            seg = int((dt - last_dt).total_seconds())
+            if seg > 0:
+                if last_st == 'online':
+                    online_sec += seg
+                elif last_st == 'offline':
+                    offline_sec += seg
+            last_dt, last_st = dt, st
+
+        # extend the last segment to now (assume status persisted)
+        now_dt = datetime.now(KYIV_TZ)
+        seg = int((now_dt - last_dt).total_seconds())
+        if seg > 0:
+            if last_st == 'online':
+                online_sec += seg
+            elif last_st == 'offline':
+                offline_sec += seg
+
+        total_sec = online_sec + offline_sec
+
+        return {
+            'ok': True,
+            'device_id': device_id,
+            'device_name': device_name,
+            'online_hours': round(online_sec / 3600.0, 2),
+            'offline_hours': round(offline_sec / 3600.0, 2),
+            'total_hours': round(total_sec / 3600.0, 2),
+            'range_from': range_from.isoformat() if range_from else None,
+            'range_to': now_dt.isoformat(),
+            'source': 'gsheets',
+        }
+
+    except Exception as e:
+        return {
+            'ok': False,
+            'error': str(e),
+            'device_id': device_id,
+            'device_name': device_name,
+            'online_hours': 0.0,
+            'offline_hours': 0.0,
+            'total_hours': 0.0,
+            'range_from': None,
+            'range_to': None,
+            'source': 'gsheets',
+        }
+
+
+@app.get('/api/charts/internet-ratio')
+def api_charts_internet_ratio():
+    cache_key = f"internet_ratio:{INTERNET_DEVICE_ID or ''}"
+    cached = _charts_cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    data = compute_internet_ratio_from_gsheets()
+    _charts_cache_set(cache_key, data)
+    return jsonify(data)
+
+
+def compute_internet_ratio_daily_from_gsheets():
+    """Daily ONLINE vs OFFLINE hours by date for the Internet chart device (Kyiv dates), based on Events sheet."""
+    device_id = (INTERNET_DEVICE_ID or '').strip()
+    device_name = (INTERNET_DEVICE_NAME or 'Коридор').strip()
+
+    if not google_enabled():
+        return {
+            'ok': False,
+            'error': 'Google is disabled (missing GDRIVE_SA_JSON_B64)',
+            'device_id': device_id,
+            'device_name': device_name,
+            'dates': [],
+            'online_hours': [],
+            'offline_hours': [],
+            'offline_pct': [],
+            'range_from': None,
+            'range_to': None,
+            'source': 'gsheets',
+        }
+
+    try:
+        sid = ensure_events_spreadsheet_id()
+        sheets = get_sheets_service()
+
+        rng = f"{GDRIVE_EVENTS_TAB_NAME}!A:E"
+        values = sheets.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get('values', [])
+        if not values or len(values) < 2:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'dates': [],
+                'online_hours': [],
+                'offline_hours': [],
+                'offline_pct': [],
+                'range_from': None,
+                'range_to': None,
+                'source': 'gsheets',
+            }
+
+        header = values[0]
+        i_time, i_dev, i_type = 0, 2, 4
+        try:
+            if isinstance(header, list) and header:
+                if 'received_at_kyiv' in header:
+                    i_time = header.index('received_at_kyiv')
+                elif 'received_at_utc' in header:
+                    i_time = header.index('received_at_utc')
+                if 'device_id' in header:
+                    i_dev = header.index('device_id')
+                if 'msg_type' in header:
+                    i_type = header.index('msg_type')
+        except Exception:
+            pass
+
+        events = _extract_status_events(values, device_id=device_id, i_time=i_time, i_dev=i_dev, i_type=i_type)
+        if not events:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'dates': [],
+                'online_hours': [],
+                'offline_hours': [],
+                'offline_pct': [],
+                'range_from': None,
+                'range_to': None,
+                'source': 'gsheets',
+            }
+
+        bucket = {}
+        last_dt, last_st = events[0]
+        last_dt = _dt_ensure_tz(last_dt).astimezone(KYIV_TZ)
+        range_from = last_dt
+
+        for dt, st in events[1:]:
+            dt = _dt_ensure_tz(dt).astimezone(KYIV_TZ)
+            _accumulate_daily(bucket, last_dt, dt, last_st)
+            last_dt, last_st = dt, st
+
+        now_dt = datetime.now(KYIV_TZ)
+        _accumulate_daily(bucket, last_dt, now_dt, last_st)
+
+        dates = sorted(bucket.keys())
+        online_hours = []
+        offline_hours = []
+        offline_pct = []
+        for d in dates:
+            on = bucket[d]['online_sec']
+            off = bucket[d]['offline_sec']
+            total = on + off
+            online_hours.append(round(on / 3600.0, 2))
+            offline_hours.append(round(off / 3600.0, 2))
+            pct = (off / total * 100.0) if total > 0 else 0.0
+            offline_pct.append(round(pct, 2))
+
+        return {
+            'ok': True,
+            'device_id': device_id,
+            'device_name': device_name,
+            'dates': dates,
+            'online_hours': online_hours,
+            'offline_hours': offline_hours,
+            'offline_pct': offline_pct,
+            'range_from': range_from.isoformat() if range_from else None,
+            'range_to': now_dt.isoformat(),
+            'source': 'gsheets',
+        }
+
+    except Exception as e:
+        return {
+            'ok': False,
+            'error': str(e),
+            'device_id': device_id,
+            'device_name': device_name,
+            'dates': [],
+            'online_hours': [],
+            'offline_hours': [],
+            'offline_pct': [],
+            'range_from': None,
+            'range_to': None,
+            'source': 'gsheets',
+        }
+
+
+@app.get('/api/charts/internet-daily')
+def api_charts_internet_daily():
+    cache_key = f"internet_daily:{INTERNET_DEVICE_ID or ''}"
+    cached = _charts_cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+
+    data = compute_internet_ratio_daily_from_gsheets()
+    _charts_cache_set(cache_key, data)
+    return jsonify(data)
+
+
 @app.get("/charts")
 def charts_page():
     devices = get_devices()
@@ -2973,10 +3249,23 @@ def charts_page():
     <canvas id="dailyChart" height="140"></canvas>
   </div>
 
+  <div class="card" style="margin-top:14px;">
+    <div class="muted" style="margin-bottom:8px;"><b>Internet availability</b> (configured device)</div>
+    <div class="muted" id="internet_ratio_meta" style="margin-bottom:8px;"></div>
+    <canvas id="internetRatioChart" height="120"></canvas>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <div class="muted" id="internet_daily_meta" style="margin-bottom:8px;"></div>
+    <canvas id="internetDailyChart" height="140"></canvas>
+  </div>
+
 <script>
 let chartObj = null;
 let ratioObj = null;
 let dailyObj = null;
+let internetRatioObj = null;
+let internetDailyObj = null;
 
 async function reloadChart(){
   const device = document.getElementById('device').value;
@@ -3119,10 +3408,105 @@ async function reloadDaily(){
   });
 }
 
+
+async function reloadInternetRatio(){
+  const metaEl = document.getElementById('internet_ratio_meta');
+  metaEl.textContent = 'Loading internet ratio...';
+
+  const res = await fetch('/api/charts/internet-ratio');
+  const data = await res.json();
+
+  if (!data.ok){
+    metaEl.textContent = 'Error: ' + (data.error || 'unknown');
+    return;
+  }
+
+  metaEl.textContent = `${data.device_name} (${data.device_id}) | online: ${data.online_hours}h, offline: ${data.offline_hours}h | from ${data.range_from || '-'} to ${data.range_to || '-'}`;
+
+  const ctx = document.getElementById('internetRatioChart').getContext('2d');
+  if (internetRatioObj) internetRatioObj.destroy();
+
+  internetRatioObj = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: ['Internet ON (hours)', 'Internet OFF (hours)'],
+      datasets: [{
+        data: [data.online_hours, data.offline_hours]
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        title: { display: true, text: `Internet availability ratio — hours` },
+        tooltip: { mode: 'nearest' }
+      }
+    }
+  });
+}
+
+async function reloadInternetDaily(){
+  const metaEl = document.getElementById('internet_daily_meta');
+  metaEl.textContent = 'Loading internet daily...';
+
+  const res = await fetch('/api/charts/internet-daily');
+  const data = await res.json();
+
+  if (!data.ok){
+    metaEl.textContent = 'Error: ' + (data.error || 'unknown');
+    return;
+  }
+
+  const n = (data.dates || []).length;
+  metaEl.textContent = `${data.device_name} (${data.device_id}) | days: ${n} | from ${data.range_from || '-'} to ${data.range_to || '-'}`;
+
+  const ctx = document.getElementById('internetDailyChart').getContext('2d');
+  if (internetDailyObj) internetDailyObj.destroy();
+
+  internetDailyObj = new Chart(ctx, {
+    data: {
+      labels: data.dates,
+      datasets: [
+        { type: 'bar', label: 'Internet ON (hours)', data: data.online_hours, stack: 'hours', backgroundColor: 'rgba(0, 200, 83, 0.55)' },
+        { type: 'bar', label: 'Internet OFF (hours)', data: data.offline_hours, stack: 'hours', backgroundColor: 'rgba(244, 67, 54, 0.55)' },
+        { type: 'line', label: 'OFF (%)', data: data.offline_pct, yAxisID: 'y1', tension: 0.35, pointRadius: 0, borderColor: 'rgba(244, 67, 54, 0.9)' }
+      ]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        title: { display: true, text: `Internet availability by date` },
+        tooltip: { mode: 'index', intersect: false }
+      },
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: {
+          stacked: true,
+          ticks: { autoSkip: true, maxTicksLimit: 14, maxRotation: 0 }
+        },
+        y: {
+          stacked: true,
+          beginAtZero: true,
+          title: { display: true, text: 'Hours' }
+        },
+        y1: {
+          beginAtZero: true,
+          min: 0,
+          max: 100,
+          position: 'right',
+          grid: { drawOnChartArea: false },
+          title: { display: true, text: 'OFF (%)' }
+        }
+      }
+    }
+  });
+}
+
 function refreshAll(){
   reloadChart();
   reloadRatio();
   reloadDaily();
+  reloadInternetRatio();
+  reloadInternetDaily();
 }
 
 refreshAll();

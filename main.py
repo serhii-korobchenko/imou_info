@@ -2443,6 +2443,112 @@ def _compute_outages_from_status_events(events):
     return outages
 
 
+def _is_date_only(s: str) -> bool:
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", (s or "").strip()))
+
+
+def _parse_charts_range_args(args):
+    """Parse common chart range params.
+    Supported:
+      - days=<int>  (last N days)
+      - date_from=YYYY-MM-DD (or ISO datetime)
+      - date_to=YYYY-MM-DD (or ISO datetime). If date-only, treated as inclusive end date (we add +1 day).
+    Returns (start_dt|None, end_dt, sig_str).
+    """
+    now_dt = datetime.now(KYIV_TZ)
+
+    days_raw = (args.get("days") or "").strip()
+    date_from = (args.get("date_from") or args.get("from") or "").strip()
+    date_to = (args.get("date_to") or args.get("to") or "").strip()
+
+    start_dt = None
+    end_dt = None
+
+    if days_raw:
+        try:
+            days = int(float(days_raw))
+            if days > 0:
+                end_dt = now_dt
+                start_dt = end_dt - timedelta(days=days)
+        except Exception:
+            start_dt = None
+            end_dt = None
+
+    if start_dt is None and (date_from or date_to):
+        if date_from:
+            dt = _parse_iso_dt(date_from)
+            if dt:
+                dt = _dt_ensure_tz(dt).astimezone(KYIV_TZ)
+                if _is_date_only(date_from):
+                    dt = datetime(dt.year, dt.month, dt.day, tzinfo=KYIV_TZ)
+                start_dt = dt
+
+        if date_to:
+            dt = _parse_iso_dt(date_to)
+            if dt:
+                dt = _dt_ensure_tz(dt).astimezone(KYIV_TZ)
+                if _is_date_only(date_to):
+                    # inclusive end date -> use next midnight as exclusive bound
+                    dt = datetime(dt.year, dt.month, dt.day, tzinfo=KYIV_TZ) + timedelta(days=1)
+                end_dt = dt
+
+    if end_dt is None:
+        end_dt = now_dt
+
+    # Clamp end to now (no future ranges)
+    if end_dt > now_dt:
+        end_dt = now_dt
+
+    # If user provided only end date, keep start_dt None (meaning "from first event")
+    # If user provided only start date, end defaults to now
+
+    sig = "all"
+    if days_raw and start_dt is not None:
+        sig = f"days={days_raw}"
+    elif date_from or date_to:
+        sig = f"from={date_from or ''};to={date_to or ''}"
+
+    return start_dt, end_dt, sig
+
+
+def _status_timeline_for_range(events, start_dt: datetime, end_dt: datetime):
+    """Build a status timeline clipped to [start_dt, end_dt) in Kyiv TZ.
+    events: list[(dt,status)] sorted, status in {'online','offline'}.
+    Returns list[(dt,status)] starting at start_dt.
+    """
+    if not events:
+        return []
+
+    start_dt = _dt_ensure_tz(start_dt).astimezone(KYIV_TZ)
+    end_dt = _dt_ensure_tz(end_dt).astimezone(KYIV_TZ)
+    if end_dt <= start_dt:
+        return []
+
+    ev = [(_dt_ensure_tz(dt).astimezone(KYIV_TZ), st) for dt, st in events]
+    ev.sort(key=lambda x: x[0])
+
+    # Status at range start = last event <= start_dt (fallback: first event status)
+    init_st = ev[0][1]
+    for dt, st in ev:
+        if dt <= start_dt:
+            init_st = st
+        else:
+            break
+
+    timeline = [(start_dt, init_st)]
+    for dt, st in ev:
+        if dt <= start_dt:
+            continue
+        if dt >= end_dt:
+            break
+        if st == timeline[-1][1]:
+            continue
+        timeline.append((dt, st))
+
+    return timeline
+
+
+
 def compute_minute_hist_from_gsheets(device_id: str, msg_type: str):
     """Reads Events sheet and computes minute histogram for device_id + msg_type.
 
@@ -2590,8 +2696,11 @@ def api_charts_minute_hist():
 
 
 
-def compute_power_ratio_parking_from_gsheets():
-    """Compute total ONLINE vs OFFLINE hours for the Parking device, based on status changes in Events sheet."""
+def compute_power_ratio_parking_from_gsheets(range_start: datetime = None, range_end: datetime = None):
+    """Compute total ONLINE vs OFFLINE hours for the Parking device, based on status changes in Events sheet.
+
+    If range_start/range_end are provided, the result is clipped to [range_start, range_end) in Kyiv TZ.
+    """
     device_id = (TELEGRAM_PARKING_DEVICE_ID or '').strip()
     device_name = (TELEGRAM_PARKING_DEVICE_NAME or 'Парковка').strip()
 
@@ -2657,13 +2766,35 @@ def compute_power_ratio_parking_from_gsheets():
                 'source': 'gsheets',
             }
 
+        now_dt = datetime.now(KYIV_TZ)
+        end_dt = _dt_ensure_tz(range_end).astimezone(KYIV_TZ) if range_end else now_dt
+        if end_dt > now_dt:
+            end_dt = now_dt
+
+        start_dt = _dt_ensure_tz(range_start).astimezone(KYIV_TZ) if range_start else _dt_ensure_tz(events[0][0]).astimezone(KYIV_TZ)
+
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        timeline = _status_timeline_for_range(events, start_dt, end_dt)
+        if not timeline:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'online_hours': 0.0,
+                'offline_hours': 0.0,
+                'total_hours': 0.0,
+                'range_from': start_dt.isoformat() if start_dt else None,
+                'range_to': end_dt.isoformat() if end_dt else None,
+                'source': 'gsheets',
+            }
+
         online_sec = 0
         offline_sec = 0
 
-        last_dt, last_st = events[0]
-        range_from = last_dt
-
-        for dt, st in events[1:]:
+        last_dt, last_st = timeline[0]
+        for dt, st in timeline[1:]:
             seg = int((dt - last_dt).total_seconds())
             if seg > 0:
                 if last_st == 'online':
@@ -2672,9 +2803,8 @@ def compute_power_ratio_parking_from_gsheets():
                     offline_sec += seg
             last_dt, last_st = dt, st
 
-        # extend the last segment to now (assume status persisted)
-        now_dt = datetime.now(KYIV_TZ)
-        seg = int((now_dt - last_dt).total_seconds())
+        # final segment to end_dt
+        seg = int((end_dt - last_dt).total_seconds())
         if seg > 0:
             if last_st == 'online':
                 online_sec += seg
@@ -2690,8 +2820,8 @@ def compute_power_ratio_parking_from_gsheets():
             'online_hours': round(online_sec / 3600.0, 2),
             'offline_hours': round(offline_sec / 3600.0, 2),
             'total_hours': round(total_sec / 3600.0, 2),
-            'range_from': range_from.isoformat() if range_from else None,
-            'range_to': now_dt.isoformat(),
+            'range_from': start_dt.isoformat() if start_dt else None,
+            'range_to': end_dt.isoformat() if end_dt else None,
             'source': 'gsheets',
         }
 
@@ -2712,12 +2842,14 @@ def compute_power_ratio_parking_from_gsheets():
 
 @app.get('/api/charts/power-ratio')
 def api_charts_power_ratio():
-    cache_key = f"power_ratio:{TELEGRAM_PARKING_DEVICE_ID or ''}"
+    start_dt, end_dt, sig = _parse_charts_range_args(request.args)
+
+    cache_key = f"power_ratio:{TELEGRAM_PARKING_DEVICE_ID or ''}:{sig}:{start_dt.isoformat() if start_dt else ''}:{end_dt.isoformat() if end_dt else ''}"
     cached = _charts_cache_get(cache_key)
     if cached is not None:
         return jsonify(cached)
 
-    data = compute_power_ratio_parking_from_gsheets()
+    data = compute_power_ratio_parking_from_gsheets(start_dt, end_dt)
     _charts_cache_set(cache_key, data)
     return jsonify(data)
 
@@ -2758,8 +2890,12 @@ def _accumulate_daily(bucket: dict, start_dt: datetime, end_dt: datetime, st: st
             b['offline_sec'] += sec
 
 
-def compute_power_ratio_daily_parking_from_gsheets():
-    """Daily ONLINE vs OFFLINE hours by date for the Parking device (Kyiv dates), based on Events sheet."""
+def compute_power_ratio_daily_parking_from_gsheets(range_start: datetime = None, range_end: datetime = None):
+    """Daily ONLINE vs OFFLINE hours by date for the Parking device (Kyiv dates), based on Events sheet.
+
+    If range_start/range_end are provided, the result is clipped to [range_start, range_end) in Kyiv TZ.
+    Output remains *per-day* (stacked bars + OFF%).
+    """
     device_id = (TELEGRAM_PARKING_DEVICE_ID or '').strip()
     device_name = (TELEGRAM_PARKING_DEVICE_NAME or 'Парковка').strip()
 
@@ -2828,18 +2964,37 @@ def compute_power_ratio_daily_parking_from_gsheets():
                 'source': 'gsheets',
             }
 
-        bucket = {}
-        last_dt, last_st = events[0]
-        last_dt = _dt_ensure_tz(last_dt).astimezone(KYIV_TZ)
-        range_from = last_dt
+        now_dt = datetime.now(KYIV_TZ)
+        end_dt = _dt_ensure_tz(range_end).astimezone(KYIV_TZ) if range_end else now_dt
+        if end_dt > now_dt:
+            end_dt = now_dt
 
-        for dt, st in events[1:]:
-            dt = _dt_ensure_tz(dt).astimezone(KYIV_TZ)
+        start_dt = _dt_ensure_tz(range_start).astimezone(KYIV_TZ) if range_start else _dt_ensure_tz(events[0][0]).astimezone(KYIV_TZ)
+
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        timeline = _status_timeline_for_range(events, start_dt, end_dt)
+        if not timeline:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'dates': [],
+                'online_hours': [],
+                'offline_hours': [],
+                'offline_pct': [],
+                'range_from': start_dt.isoformat() if start_dt else None,
+                'range_to': end_dt.isoformat() if end_dt else None,
+                'source': 'gsheets',
+            }
+
+        bucket = {}
+        last_dt, last_st = timeline[0]
+        for dt, st in timeline[1:]:
             _accumulate_daily(bucket, last_dt, dt, last_st)
             last_dt, last_st = dt, st
-
-        now_dt = datetime.now(KYIV_TZ)
-        _accumulate_daily(bucket, last_dt, now_dt, last_st)
+        _accumulate_daily(bucket, last_dt, end_dt, last_st)
 
         dates = sorted(bucket.keys())
         online_hours = []
@@ -2862,8 +3017,8 @@ def compute_power_ratio_daily_parking_from_gsheets():
             'online_hours': online_hours,
             'offline_hours': offline_hours,
             'offline_pct': offline_pct,
-            'range_from': range_from.isoformat() if range_from else None,
-            'range_to': now_dt.isoformat(),
+            'range_from': start_dt.isoformat() if start_dt else None,
+            'range_to': end_dt.isoformat() if end_dt else None,
             'source': 'gsheets',
         }
 
@@ -2885,12 +3040,14 @@ def compute_power_ratio_daily_parking_from_gsheets():
 
 @app.get('/api/charts/power-daily')
 def api_charts_power_daily():
-    cache_key = f"power_daily:{TELEGRAM_PARKING_DEVICE_ID or ''}"
+    start_dt, end_dt, sig = _parse_charts_range_args(request.args)
+
+    cache_key = f"power_daily:{TELEGRAM_PARKING_DEVICE_ID or ''}:{sig}:{start_dt.isoformat() if start_dt else ''}:{end_dt.isoformat() if end_dt else ''}"
     cached = _charts_cache_get(cache_key)
     if cached is not None:
         return jsonify(cached)
 
-    data = compute_power_ratio_daily_parking_from_gsheets()
+    data = compute_power_ratio_daily_parking_from_gsheets(start_dt, end_dt)
     _charts_cache_set(cache_key, data)
     return jsonify(data)
 
@@ -2898,8 +3055,11 @@ def api_charts_power_daily():
 # -----------------------------
 # Charts: Internet availability (Corridor / configured device)
 # -----------------------------
-def compute_internet_ratio_from_gsheets():
-    """Compute total ONLINE vs OFFLINE hours for the Internet chart device, based on status changes in Events sheet."""
+def compute_internet_ratio_from_gsheets(range_start: datetime = None, range_end: datetime = None):
+    """Compute total ONLINE vs OFFLINE hours for the Internet chart device, based on status changes in Events sheet.
+
+    If range_start/range_end are provided, the result is clipped to [range_start, range_end) in Kyiv TZ.
+    """
     device_id = (INTERNET_DEVICE_ID or '').strip()
     device_name = (INTERNET_DEVICE_NAME or 'Коридор').strip()
 
@@ -2965,13 +3125,35 @@ def compute_internet_ratio_from_gsheets():
                 'source': 'gsheets',
             }
 
+        now_dt = datetime.now(KYIV_TZ)
+        end_dt = _dt_ensure_tz(range_end).astimezone(KYIV_TZ) if range_end else now_dt
+        if end_dt > now_dt:
+            end_dt = now_dt
+
+        start_dt = _dt_ensure_tz(range_start).astimezone(KYIV_TZ) if range_start else _dt_ensure_tz(events[0][0]).astimezone(KYIV_TZ)
+
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        timeline = _status_timeline_for_range(events, start_dt, end_dt)
+        if not timeline:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'online_hours': 0.0,
+                'offline_hours': 0.0,
+                'total_hours': 0.0,
+                'range_from': start_dt.isoformat() if start_dt else None,
+                'range_to': end_dt.isoformat() if end_dt else None,
+                'source': 'gsheets',
+            }
+
         online_sec = 0
         offline_sec = 0
 
-        last_dt, last_st = events[0]
-        range_from = last_dt
-
-        for dt, st in events[1:]:
+        last_dt, last_st = timeline[0]
+        for dt, st in timeline[1:]:
             seg = int((dt - last_dt).total_seconds())
             if seg > 0:
                 if last_st == 'online':
@@ -2980,9 +3162,7 @@ def compute_internet_ratio_from_gsheets():
                     offline_sec += seg
             last_dt, last_st = dt, st
 
-        # extend the last segment to now (assume status persisted)
-        now_dt = datetime.now(KYIV_TZ)
-        seg = int((now_dt - last_dt).total_seconds())
+        seg = int((end_dt - last_dt).total_seconds())
         if seg > 0:
             if last_st == 'online':
                 online_sec += seg
@@ -2998,8 +3178,8 @@ def compute_internet_ratio_from_gsheets():
             'online_hours': round(online_sec / 3600.0, 2),
             'offline_hours': round(offline_sec / 3600.0, 2),
             'total_hours': round(total_sec / 3600.0, 2),
-            'range_from': range_from.isoformat() if range_from else None,
-            'range_to': now_dt.isoformat(),
+            'range_from': start_dt.isoformat() if start_dt else None,
+            'range_to': end_dt.isoformat() if end_dt else None,
             'source': 'gsheets',
         }
 
@@ -3020,18 +3200,24 @@ def compute_internet_ratio_from_gsheets():
 
 @app.get('/api/charts/internet-ratio')
 def api_charts_internet_ratio():
-    cache_key = f"internet_ratio:{INTERNET_DEVICE_ID or ''}"
+    start_dt, end_dt, sig = _parse_charts_range_args(request.args)
+
+    cache_key = f"internet_ratio:{INTERNET_DEVICE_ID or ''}:{sig}:{start_dt.isoformat() if start_dt else ''}:{end_dt.isoformat() if end_dt else ''}"
     cached = _charts_cache_get(cache_key)
     if cached is not None:
         return jsonify(cached)
 
-    data = compute_internet_ratio_from_gsheets()
+    data = compute_internet_ratio_from_gsheets(start_dt, end_dt)
     _charts_cache_set(cache_key, data)
     return jsonify(data)
 
 
-def compute_internet_ratio_daily_from_gsheets():
-    """Daily ONLINE vs OFFLINE hours by date for the Internet chart device (Kyiv dates), based on Events sheet."""
+def compute_internet_ratio_daily_from_gsheets(range_start: datetime = None, range_end: datetime = None):
+    """Daily ONLINE vs OFFLINE hours by date for the Internet chart device (Kyiv dates), based on Events sheet.
+
+    If range_start/range_end are provided, the result is clipped to [range_start, range_end) in Kyiv TZ.
+    Output remains *per-day* (stacked bars + OFF%).
+    """
     device_id = (INTERNET_DEVICE_ID or '').strip()
     device_name = (INTERNET_DEVICE_NAME or 'Коридор').strip()
 
@@ -3100,18 +3286,37 @@ def compute_internet_ratio_daily_from_gsheets():
                 'source': 'gsheets',
             }
 
-        bucket = {}
-        last_dt, last_st = events[0]
-        last_dt = _dt_ensure_tz(last_dt).astimezone(KYIV_TZ)
-        range_from = last_dt
+        now_dt = datetime.now(KYIV_TZ)
+        end_dt = _dt_ensure_tz(range_end).astimezone(KYIV_TZ) if range_end else now_dt
+        if end_dt > now_dt:
+            end_dt = now_dt
 
-        for dt, st in events[1:]:
-            dt = _dt_ensure_tz(dt).astimezone(KYIV_TZ)
+        start_dt = _dt_ensure_tz(range_start).astimezone(KYIV_TZ) if range_start else _dt_ensure_tz(events[0][0]).astimezone(KYIV_TZ)
+
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        timeline = _status_timeline_for_range(events, start_dt, end_dt)
+        if not timeline:
+            return {
+                'ok': True,
+                'device_id': device_id,
+                'device_name': device_name,
+                'dates': [],
+                'online_hours': [],
+                'offline_hours': [],
+                'offline_pct': [],
+                'range_from': start_dt.isoformat() if start_dt else None,
+                'range_to': end_dt.isoformat() if end_dt else None,
+                'source': 'gsheets',
+            }
+
+        bucket = {}
+        last_dt, last_st = timeline[0]
+        for dt, st in timeline[1:]:
             _accumulate_daily(bucket, last_dt, dt, last_st)
             last_dt, last_st = dt, st
-
-        now_dt = datetime.now(KYIV_TZ)
-        _accumulate_daily(bucket, last_dt, now_dt, last_st)
+        _accumulate_daily(bucket, last_dt, end_dt, last_st)
 
         dates = sorted(bucket.keys())
         online_hours = []
@@ -3134,8 +3339,8 @@ def compute_internet_ratio_daily_from_gsheets():
             'online_hours': online_hours,
             'offline_hours': offline_hours,
             'offline_pct': offline_pct,
-            'range_from': range_from.isoformat() if range_from else None,
-            'range_to': now_dt.isoformat(),
+            'range_from': start_dt.isoformat() if start_dt else None,
+            'range_to': end_dt.isoformat() if end_dt else None,
             'source': 'gsheets',
         }
 
@@ -3157,12 +3362,14 @@ def compute_internet_ratio_daily_from_gsheets():
 
 @app.get('/api/charts/internet-daily')
 def api_charts_internet_daily():
-    cache_key = f"internet_daily:{INTERNET_DEVICE_ID or ''}"
+    start_dt, end_dt, sig = _parse_charts_range_args(request.args)
+
+    cache_key = f"internet_daily:{INTERNET_DEVICE_ID or ''}:{sig}:{start_dt.isoformat() if start_dt else ''}:{end_dt.isoformat() if end_dt else ''}"
     cached = _charts_cache_get(cache_key)
     if cached is not None:
         return jsonify(cached)
 
-    data = compute_internet_ratio_daily_from_gsheets()
+    data = compute_internet_ratio_daily_from_gsheets(start_dt, end_dt)
     _charts_cache_set(cache_key, data)
     return jsonify(data)
 
@@ -3187,7 +3394,7 @@ def charts_page():
     .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; }
     .row { display:flex; gap:12px; flex-wrap:wrap; align-items:end; }
     label { font-size: 12px; color: #666; }
-    select, button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ddd; background: #fff; }
+    select, button, input[type="date"] { padding: 8px 12px; border-radius: 10px; border: 1px solid #ddd; background: #fff; }
     button { cursor:pointer; }
     button:hover { background:#fafafa; }
     .muted { color:#666; font-size: 12px; }
@@ -3226,6 +3433,30 @@ def charts_page():
           <option value="online">online</option>
         </select>
       </div>
+
+
+<div>
+  <label>Period</label><br/>
+  <select id="period">
+    <option value="all" selected>all time</option>
+    <option value="7">last 7 days</option>
+    <option value="14">last 14 days</option>
+    <option value="30">last 30 days</option>
+    <option value="90">last 90 days</option>
+    <option value="180">last 180 days</option>
+    <option value="365">last 365 days</option>
+  </select>
+</div>
+
+<div>
+  <label>Date from</label><br/>
+  <input id="date_from" type="date"/>
+</div>
+
+<div>
+  <label>Date to</label><br/>
+  <input id="date_to" type="date"/>
+</div>
 
       <div>
         <button onclick="refreshAll()">Refresh</button>
@@ -3266,6 +3497,21 @@ let ratioObj = null;
 let dailyObj = null;
 let internetRatioObj = null;
 let internetDailyObj = null;
+
+function periodSuffix(){
+  const days = document.getElementById('period')?.value || 'all';
+  const df = document.getElementById('date_from')?.value || '';
+  const dt = document.getElementById('date_to')?.value || '';
+  const p = new URLSearchParams();
+  if (days && days !== 'all') {
+    p.set('days', days);
+  } else {
+    if (df) p.set('date_from', df);
+    if (dt) p.set('date_to', dt);
+  }
+  const s = p.toString();
+  return s ? ('?' + s) : '';
+}
 
 async function reloadChart(){
   const device = document.getElementById('device').value;
@@ -3319,7 +3565,7 @@ async function reloadRatio(){
   const metaEl = document.getElementById('ratio_meta');
   metaEl.textContent = 'Loading ratio...';
 
-  const res = await fetch('/api/charts/power-ratio');
+  const res = await fetch('/api/charts/power-ratio' + periodSuffix());
   const data = await res.json();
 
   if (!data.ok){
@@ -3355,7 +3601,7 @@ async function reloadDaily(){
   const metaEl = document.getElementById('daily_meta');
   metaEl.textContent = 'Loading daily...';
 
-  const res = await fetch('/api/charts/power-daily');
+  const res = await fetch('/api/charts/power-daily' + periodSuffix());
   const data = await res.json();
 
   if (!data.ok){
@@ -3413,7 +3659,7 @@ async function reloadInternetRatio(){
   const metaEl = document.getElementById('internet_ratio_meta');
   metaEl.textContent = 'Loading internet ratio...';
 
-  const res = await fetch('/api/charts/internet-ratio');
+  const res = await fetch('/api/charts/internet-ratio' + periodSuffix());
   const data = await res.json();
 
   if (!data.ok){
@@ -3448,7 +3694,7 @@ async function reloadInternetDaily(){
   const metaEl = document.getElementById('internet_daily_meta');
   metaEl.textContent = 'Loading internet daily...';
 
-  const res = await fetch('/api/charts/internet-daily');
+  const res = await fetch('/api/charts/internet-daily' + periodSuffix());
   const data = await res.json();
 
   if (!data.ok){
@@ -3466,8 +3712,8 @@ async function reloadInternetDaily(){
     data: {
       labels: data.dates,
       datasets: [
-        { type: 'bar', label: 'Internet ON (hours)', data: data.online_hours, stack: 'hours', backgroundColor: 'rgba(0, 200, 83, 0.35)' },
-        { type: 'bar', label: 'Internet OFF (hours)', data: data.offline_hours, stack: 'hours', backgroundColor: 'rgba(244, 67, 54, 0.35)' },
+        { type: 'bar', label: 'Internet ON (hours)', data: data.online_hours, stack: 'hours', backgroundColor: 'rgba(0, 200, 83, 0.55)' },
+        { type: 'bar', label: 'Internet OFF (hours)', data: data.offline_hours, stack: 'hours', backgroundColor: 'rgba(244, 67, 54, 0.55)' },
         { type: 'line', label: 'OFF (%)', data: data.offline_pct, yAxisID: 'y1', tension: 0.35, pointRadius: 0, borderColor: 'rgba(244, 67, 54, 0.9)' }
       ]
     },

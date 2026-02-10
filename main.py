@@ -3466,8 +3466,8 @@ async function reloadInternetDaily(){
     data: {
       labels: data.dates,
       datasets: [
-        { type: 'bar', label: 'Internet ON (hours)', data: data.online_hours, stack: 'hours', backgroundColor: 'rgba(0, 200, 83, 0.55)' },
-        { type: 'bar', label: 'Internet OFF (hours)', data: data.offline_hours, stack: 'hours', backgroundColor: 'rgba(244, 67, 54, 0.55)' },
+        { type: 'bar', label: 'Internet ON (hours)', data: data.online_hours, stack: 'hours', backgroundColor: 'rgba(0, 200, 83, 0.35)' },
+        { type: 'bar', label: 'Internet OFF (hours)', data: data.offline_hours, stack: 'hours', backgroundColor: 'rgba(244, 67, 54, 0.35)' },
         { type: 'line', label: 'OFF (%)', data: data.offline_pct, yAxisID: 'y1', tension: 0.35, pointRadius: 0, borderColor: 'rgba(244, 67, 54, 0.9)' }
       ]
     },

@@ -2327,8 +2327,34 @@ def imou_callback():
 # -----------------------------
 _CHARTS_CACHE = {}
 CHARTS_CACHE_TTL_SEC = int(os.getenv("CHARTS_CACHE_TTL_SEC", "300"))
+CHARTS_CACHE_MAX_ITEMS = int(os.getenv("CHARTS_CACHE_MAX_ITEMS", "128"))
 CHARTS_SMOOTH_SIGMA = float(os.getenv("CHARTS_SMOOTH_SIGMA", "2.0"))
 CHARTS_MIN_OUTAGE_MINUTES = int(os.getenv("CHARTS_MIN_OUTAGE_MINUTES", "10"))  # ignore outages shorter than this on charts
+
+
+def _charts_cache_prune(now_ts: float | None = None):
+    """Keep charts cache bounded to avoid unbounded RAM growth on long-lived instances."""
+    if not _CHARTS_CACHE:
+        return
+    now_ts = float(now_ts or time.time())
+
+    # 1) Drop expired entries first
+    expired = [k for k, v in _CHARTS_CACHE.items() if (now_ts - float((v or {}).get("ts") or 0.0)) > CHARTS_CACHE_TTL_SEC]
+    for k in expired:
+        _CHARTS_CACHE.pop(k, None)
+
+    # 2) Bound total size (oldest first)
+    max_items = max(16, int(CHARTS_CACHE_MAX_ITEMS or 128))
+    overflow = len(_CHARTS_CACHE) - max_items
+    if overflow <= 0:
+        return
+
+    oldest = sorted(
+        ((k, float((v or {}).get("ts") or 0.0)) for k, v in _CHARTS_CACHE.items()),
+        key=lambda x: x[1],
+    )
+    for k, _ in oldest[:overflow]:
+        _CHARTS_CACHE.pop(k, None)
 
 
 def _charts_cache_get(key: str):
@@ -2336,12 +2362,15 @@ def _charts_cache_get(key: str):
     if not hit:
         return None
     if time.time() - hit.get("ts", 0) > CHARTS_CACHE_TTL_SEC:
+        _CHARTS_CACHE.pop(key, None)
         return None
     return hit.get("val")
 
 
 def _charts_cache_set(key: str, val):
-    _CHARTS_CACHE[key] = {"ts": time.time(), "val": val}
+    now_ts = time.time()
+    _CHARTS_CACHE[key] = {"ts": now_ts, "val": val}
+    _charts_cache_prune(now_ts)
 
 
 def _gaussian_smooth_60(counts, sigma: float = 2.0):

@@ -111,6 +111,26 @@ DATA_DIR = os.getenv("DATA_DIR", ".").strip()
 DB_PATH = os.path.join(DATA_DIR, "imou_status.sqlite3")
 
 IMOU_DEVICE_IDS = [d.strip() for d in os.getenv("IMOU_DEVICE_IDS", "").split(",") if d.strip()]
+# -----------------------------
+# OpenClaw IMOU transcription trigger
+# -----------------------------
+OPENCLAW_IMOU_TRANSCRIBE_URL = os.getenv("OPENCLAW_IMOU_TRANSCRIBE_URL", "").strip()
+OPENCLAW_IMOU_TRANSCRIBE_TOKEN = os.getenv("OPENCLAW_IMOU_TRANSCRIBE_TOKEN", "").strip()
+
+IMOU_TRANSCRIBE_DEVICE_ID = os.getenv("IMOU_TRANSCRIBE_DEVICE_ID", "A683BBHPSFD935E").strip()
+IMOU_TRANSCRIBE_WINDOW_SEC = int(os.getenv("IMOU_TRANSCRIBE_WINDOW_SEC", "120"))
+IMOU_TRANSCRIBE_COOLDOWN_SEC = int(os.getenv("IMOU_TRANSCRIBE_COOLDOWN_SEC", "180"))
+IMOU_TRANSCRIBE_DURATION_SEC = int(os.getenv("IMOU_TRANSCRIBE_DURATION_SEC", "15"))
+
+IMOU_HUMAN_EVENT_CODES = {
+    x.strip()
+    for x in os.getenv("IMOU_HUMAN_EVENT_CODES", "33000,312600").split(",")
+    if x.strip()
+}
+
+_IMOU_TRANSCRIBE_STATE = {}
+_IMOU_TRANSCRIBE_LOCK = threading.Lock()
+
 
 
 # -----------------------------
@@ -2231,6 +2251,120 @@ def index():
     )
 
 
+def imou_is_human_event(msg_type: str, raw: dict) -> bool:
+    if msg_type != "iotEvent":
+        return False
+    content = raw.get("content") if isinstance(raw.get("content"), dict) else {}
+    return str(content.get("event") or "") in IMOU_HUMAN_EVENT_CODES
+
+
+def imou_is_sound_event(msg_type: str, raw: dict) -> bool:
+    return (
+        msg_type == "abAlarmSound"
+        and str(raw.get("labelType") or "") == "abSoundAlarm"
+        and str(raw.get("action") or "") == "start"
+    )
+
+
+def _post_openclaw_imou_transcribe(device_id: str, trigger: dict):
+    if not OPENCLAW_IMOU_TRANSCRIBE_URL or not OPENCLAW_IMOU_TRANSCRIBE_TOKEN:
+        app.logger.warning("OpenClaw IMOU transcription trigger is not configured")
+        return
+
+    payload = {
+        "device_id": device_id,
+        "duration": IMOU_TRANSCRIBE_DURATION_SEC,
+        "source": "imou_info",
+        "trigger": trigger,
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-IMOU-TRANSCRIBE-TOKEN": OPENCLAW_IMOU_TRANSCRIBE_TOKEN,
+    }
+
+    try:
+        r = requests.post(
+            OPENCLAW_IMOU_TRANSCRIBE_URL,
+            json=payload,
+            headers=headers,
+            timeout=8,
+        )
+        if r.status_code >= 400:
+            app.logger.warning(
+                "OpenClaw IMOU transcription trigger failed: %s %s",
+                r.status_code,
+                r.text[:500],
+            )
+        else:
+            app.logger.info("OpenClaw IMOU transcription trigger accepted: %s", r.text[:500])
+    except Exception as e:
+        app.logger.warning("OpenClaw IMOU transcription trigger error: %s", e)
+
+
+def maybe_trigger_openclaw_imou_transcription(device_id: str, msg_type: str, raw: dict):
+    if not device_id or device_id == "__unknown__":
+        return
+    if device_id != IMOU_TRANSCRIBE_DEVICE_ID:
+        return
+
+    now_ts = time.time()
+    is_human = imou_is_human_event(msg_type, raw)
+    is_sound = imou_is_sound_event(msg_type, raw)
+
+    if not is_human and not is_sound:
+        return
+
+    with _IMOU_TRANSCRIBE_LOCK:
+        state = _IMOU_TRANSCRIBE_STATE.setdefault(device_id, {
+            "last_human_ts": 0.0,
+            "last_sound_ts": 0.0,
+            "last_trigger_ts": 0.0,
+            "last_human_raw": {},
+            "last_sound_raw": {},
+        })
+
+        if is_human:
+            state["last_human_ts"] = now_ts
+            state["last_human_raw"] = raw
+
+        if is_sound:
+            state["last_sound_ts"] = now_ts
+            state["last_sound_raw"] = raw
+
+        human_ts = float(state.get("last_human_ts") or 0.0)
+        sound_ts = float(state.get("last_sound_ts") or 0.0)
+        last_trigger_ts = float(state.get("last_trigger_ts") or 0.0)
+
+        has_pair = (
+            human_ts > 0
+            and sound_ts > 0
+            and abs(sound_ts - human_ts) <= IMOU_TRANSCRIBE_WINDOW_SEC
+        )
+
+        cooldown_ok = (now_ts - last_trigger_ts) >= IMOU_TRANSCRIBE_COOLDOWN_SEC
+
+        if not has_pair or not cooldown_ok:
+            return
+
+        state["last_trigger_ts"] = now_ts
+
+        trigger = {
+            "device_id": device_id,
+            "current_msg_type": msg_type,
+            "human_age_sec": round(now_ts - human_ts, 1),
+            "sound_age_sec": round(now_ts - sound_ts, 1),
+            "window_sec": IMOU_TRANSCRIBE_WINDOW_SEC,
+        }
+
+    t = threading.Thread(
+        target=_post_openclaw_imou_transcribe,
+        kwargs={"device_id": device_id, "trigger": trigger},
+        daemon=True,
+        name="openclaw-imou-transcribe",
+    )
+    t.start()
+
 @app.post("/imou/callback")
 def imou_callback():
     raw_text = request.get_data(as_text=True) or ""
@@ -2293,6 +2427,11 @@ def imou_callback():
                         summary = f"{summary} ({interval_note})"
 
             add_event(device_id, msg_type, summary, occur_time, msg)
+
+            try:
+                maybe_trigger_openclaw_imou_transcription(device_id, msg_type, msg)
+            except Exception as e:
+                app.logger.warning(f"IMOU transcription trigger check failed: {e}")
 
             # Telegram notify on status changes (for parking device only)
             if status in ("online", "offline") and prev_status != status:

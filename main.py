@@ -2000,6 +2000,52 @@ def admin_dtek_forecast():
     return jsonify(res)
 
 
+@app.get("/admin/dtek-check")
+def admin_dtek_check():
+    """Check Telethon connection and StringSession authorization without sending Telegram messages."""
+    require_admin()
+    ok, reason = _dtek_feature_ready()
+    if not ok:
+        return jsonify({"ok": False, "authorized": False, "error": reason}), 400
+
+    try:
+        res = asyncio.run(
+            asyncio.wait_for(
+                _dtek_fetch_text_via_telethon(),
+                timeout=max(6, DTEK_FETCH_TIMEOUT_SEC),
+            )
+        )
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            res = loop.run_until_complete(
+                asyncio.wait_for(
+                    _dtek_fetch_text_via_telethon(),
+                    timeout=max(6, DTEK_FETCH_TIMEOUT_SEC),
+                )
+            )
+        finally:
+            loop.close()
+    except Exception as e:
+        res = {"ok": False, "error": str(e)}
+
+    if not isinstance(res, dict):
+        res = {"ok": False, "error": "Unexpected Telethon response"}
+
+    connected = bool(res.get("ok"))
+    return jsonify({
+        "ok": connected,
+        "authorized": connected,
+        "source": res.get("source") or "",
+        "error": res.get("error") or "",
+        "message": (
+            "Telethon connection and DTEK StringSession are working"
+            if connected
+            else "Telethon/DTEK check failed"
+        ),
+    })
+
+
 @app.post("/admin/dtek-notify")
 def admin_dtek_notify():
     """Debug endpoint: send current DTEK forecast to the configured Telegram channel."""
@@ -2100,6 +2146,11 @@ def index():
         <button onclick="adminPost('/admin/clear-sheets-queue')">Clear sheets queue</button>
       </div>
       <div style="margin-top:10px;">
+        <div class="muted">DTEK / Telethon:</div>
+        <button onclick="adminDtekCheck()">Перевірити DTEK/Telethon</button>
+        <pre id="dtekCheckResult" style="white-space:pre-wrap; margin:8px 0 0;"></pre>
+      </div>
+      <div style="margin-top:10px;">
         <div class="muted">Maintenance:</div>
         <button onclick="adminPost('/admin/clear-events')">Clear events</button>
         <button onclick="adminPost('/admin/clear-callback-inbox')">Clear callback inbox</button>
@@ -2170,6 +2221,33 @@ def index():
 
 <script>
   const ADMIN_KEY_PRESENT = "{{ admin_key_present }}";
+
+  async function adminDtekCheck() {
+    if (!ADMIN_KEY_PRESENT) {
+      alert("ADMIN_KEY is not set on server.");
+      return;
+    }
+    const key = prompt("Enter ADMIN_KEY:");
+    if (!key) return;
+
+    const output = document.getElementById("dtekCheckResult");
+    output.textContent = "Перевірка...";
+    try {
+      const r = await fetch("/admin/dtek-check", {
+        headers: { "X-Admin-Key": key }
+      });
+      const t = await r.text();
+      try {
+        output.textContent = JSON.stringify(JSON.parse(t), null, 2);
+      } catch (_) {
+        output.textContent = t;
+      }
+      output.style.color = r.ok ? "#16803a" : "#b42318";
+    } catch (e) {
+      output.textContent = "Request failed: " + e;
+      output.style.color = "#b42318";
+    }
+  }
 
   async function adminPost(path, body) {
     if (!ADMIN_KEY_PRESENT) {

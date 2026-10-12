@@ -589,8 +589,8 @@ def _dtek_feature_ready() -> tuple[bool, str]:
         return False, "DTEK_FORECAST_ENABLED=0"
     if not (DTEK_TG_API_ID and DTEK_TG_API_HASH):
         return False, "Missing DTEK_TG_API_ID / DTEK_TG_API_HASH"
-    if not (DTEK_TG_SESSION or DTEK_TG_SESSION_FILE):
-        return False, "Missing DTEK_TG_SESSION or DTEK_TG_SESSION_FILE"
+    if not DTEK_TG_SESSION:
+        return False, "Missing DTEK_TG_SESSION"
     return True, ""
 
 
@@ -777,7 +777,7 @@ async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
     if not api_hash:
         return {"ok": False, "error": "DTEK_TG_API_HASH is empty"}
 
-    session = StringSession(DTEK_TG_SESSION) if DTEK_TG_SESSION else DTEK_TG_SESSION_FILE
+    session = StringSession(DTEK_TG_SESSION)
 
     # Steps: pipe-separated labels we want to "press" (send as text).
     steps = [s.strip() for s in (DTEK_MENU_SEQUENCE or "").split("|") if s.strip()]
@@ -883,8 +883,10 @@ async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
             # older Telethon without receive_updates
             return TelegramClient(session, api_id, api_hash)
 
+    client = _make_client()
     try:
-        async with _make_client() as client:
+        await client.connect()
+        try:
             if not await client.is_user_authorized():
                 return {"ok": False, "error": "Telethon session is not authorized. Create DTEK_TG_SESSION first."}
 
@@ -919,6 +921,8 @@ async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
             # 3) Return some tail text to help debugging/parse fallback
             tail = await _history_tail_text(client)
             return {"ok": True, "text": tail, "source": "history_tail"}
+        finally:
+            await client.disconnect()
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1097,12 +1101,7 @@ async def _dtek_fetch_graph_via_telethon() -> dict:
     api_id = int(DTEK_TG_API_ID)
     api_hash = str(DTEK_TG_API_HASH)
 
-    # session
-    if DTEK_TG_SESSION:
-        session = StringSession(DTEK_TG_SESSION)
-    else:
-        os.makedirs(os.path.dirname(DTEK_TG_SESSION_FILE), exist_ok=True)
-        session = DTEK_TG_SESSION_FILE
+    session = StringSession(DTEK_TG_SESSION)
 
     # Steps
     steps = []
@@ -1189,7 +1188,9 @@ async def _dtek_fetch_graph_via_telethon() -> dict:
         except TypeError:
             return TelegramClient(session, api_id, api_hash)
 
-    async with _make_client() as client:
+    client = _make_client()
+    await client.connect()
+    try:
         if not await client.is_user_authorized():
             return {"ok": False, "path": None, "note": "Telethon session is not authorized", "raw": ""}
 
@@ -1250,6 +1251,8 @@ async def _dtek_fetch_graph_via_telethon() -> dict:
             await asyncio.sleep(1.0)
 
         return {"ok": False, "path": None, "note": "no image received", "raw": ""}
+    finally:
+        await client.disconnect()
 
 
 

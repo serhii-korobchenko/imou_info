@@ -990,12 +990,12 @@ def dtek_get_forecast_cached(force: bool = False) -> dict:
 
     # Fetch + parse (best-effort)
     try:
-        res = asyncio.run(asyncio.wait_for(_dtek_fetch_text_via_telethon(), timeout=max(6, DTEK_FETCH_TIMEOUT_SEC)))
+        res = asyncio.run(asyncio.wait_for(_dtek_fetch_text_via_telethon(), timeout=max(10, DTEK_FETCH_TIMEOUT_SEC + 8)))
     except RuntimeError:
         # If we're already in an event loop (rare in Flask), create a new loop
         loop = asyncio.new_event_loop()
         try:
-            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_text_via_telethon(), timeout=max(6, DTEK_FETCH_TIMEOUT_SEC)))
+            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_text_via_telethon(), timeout=max(10, DTEK_FETCH_TIMEOUT_SEC + 8)))
         finally:
             try:
                 loop.close()
@@ -1049,11 +1049,11 @@ def dtek_get_forecast_since_offline(offline_ts: float | None = None, force: bool
 
     # Always fetch (best-effort) because this is used for the delayed OFFLINE notification.
     try:
-        res = asyncio.run(asyncio.wait_for(_dtek_fetch_text_via_telethon(since_ts=offline_ts), timeout=max(8, DTEK_FETCH_TIMEOUT_SEC)))
+        res = asyncio.run(asyncio.wait_for(_dtek_fetch_text_via_telethon(since_ts=offline_ts), timeout=max(12, DTEK_FETCH_TIMEOUT_SEC + 8)))
     except RuntimeError:
         loop = asyncio.new_event_loop()
         try:
-            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_text_via_telethon(since_ts=offline_ts), timeout=max(8, DTEK_FETCH_TIMEOUT_SEC)))
+            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_text_via_telethon(since_ts=offline_ts), timeout=max(12, DTEK_FETCH_TIMEOUT_SEC + 8)))
         finally:
             try:
                 loop.close()
@@ -2058,7 +2058,7 @@ def admin_dtek_check():
         res = asyncio.run(
             asyncio.wait_for(
                 _dtek_fetch_text_via_telethon(),
-                timeout=max(6, DTEK_FETCH_TIMEOUT_SEC),
+                timeout=max(10, DTEK_FETCH_TIMEOUT_SEC + 8),
             )
         )
     except RuntimeError:
@@ -2067,7 +2067,7 @@ def admin_dtek_check():
             res = loop.run_until_complete(
                 asyncio.wait_for(
                     _dtek_fetch_text_via_telethon(),
-                    timeout=max(6, DTEK_FETCH_TIMEOUT_SEC),
+                    timeout=max(10, DTEK_FETCH_TIMEOUT_SEC + 8),
                 )
             )
         finally:

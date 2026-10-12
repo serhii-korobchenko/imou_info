@@ -642,6 +642,18 @@ def _dtek_parse_restore_from_text(text: str) -> dict:
     if re.search(r"(відключень\s+не\s+буде|не\s+планується\s+відключень|відключення\s+не\s+передбачені)", t_norm, re.IGNORECASE):
         return {"ok": True, "restore_dt_iso": None, "restore_at_kyiv": None, "note": "відключень не планується", "raw": raw_clip}
 
+    # DTEK may report that the address has no registered outage yet, while
+    # warning that emergency information can appear later. This is a valid,
+    # current response, but it must not be presented as a scheduled restore.
+    if re.search(r"(?:наразі\s+)?не\s+зафіксовано\s+відключень", t_norm, re.IGNORECASE):
+        return {
+            "ok": True,
+            "restore_dt_iso": None,
+            "restore_at_kyiv": None,
+            "note": "за адресою наразі не зафіксовано відключень; інформація може з’явитися пізніше",
+            "raw": raw_clip,
+        }
+
     # 0) Most reliable: explicit phrase used by DTEK bot
     # Example (from your screenshot):
     #   "Орієнтовний час відновлення електроенергії: 03.02.2026 21:00."

@@ -744,6 +744,38 @@ def _dtek_parse_restore_from_text(text: str) -> dict:
     return {"ok": False, "note": "не вдалося розпізнати прогноз часу включення з відповіді ДТЕК", "raw": raw_clip}
 
 
+def _dtek_restore_is_stale(parsed: dict, now_dt: datetime | None = None) -> bool:
+    """Return True when a parsed restore time expired more than 30 minutes ago."""
+    if not isinstance(parsed, dict):
+        return False
+    restore_iso = (parsed.get("restore_dt_iso") or "").strip()
+    if not restore_iso:
+        return False
+    try:
+        restore_dt = datetime.fromisoformat(restore_iso)
+        if restore_dt.tzinfo is None:
+            restore_dt = restore_dt.replace(tzinfo=KYIV_TZ)
+        current = now_dt or datetime.now(KYIV_TZ)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=KYIV_TZ)
+        return restore_dt.astimezone(KYIV_TZ) < current.astimezone(KYIV_TZ) - timedelta(minutes=30)
+    except Exception:
+        return False
+
+
+def _dtek_reject_stale_restore(parsed: dict, now_dt: datetime | None = None) -> dict:
+    if not _dtek_restore_is_stale(parsed, now_dt=now_dt):
+        return parsed
+    out = dict(parsed)
+    out.update({
+        "ok": False,
+        "restore_dt_iso": None,
+        "restore_at_kyiv": None,
+        "note": "прогноз ДТЕК застарів; актуальний час відновлення не отримано",
+    })
+    return out
+
+
 async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
     """
     Fetch DTEK bot text via Telethon user session.
@@ -860,6 +892,11 @@ async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
                 if (mts is not None) and (mts < float(since_ts) - 120.0):
                     continue
 
+            # Do not accept an expired history entry. This makes the caller
+            # navigate the bot menu and request a fresh response instead.
+            if _dtek_restore_is_stale(_dtek_parse_restore_from_text(t)):
+                continue
+
             return t
         return None
 
@@ -943,7 +980,12 @@ def dtek_get_forecast_cached(force: bool = False) -> dict:
     except Exception:
         cached_ts = 0.0
 
-    if (not force) and cached and (now_ts - cached_ts) < max(30, int(DTEK_FORECAST_CACHE_SEC or 300)):
+    if (
+        (not force)
+        and cached
+        and (now_ts - cached_ts) < max(30, int(DTEK_FORECAST_CACHE_SEC or 300))
+        and not _dtek_restore_is_stale(cached)
+    ):
         return cached
 
     # Fetch + parse (best-effort)
@@ -980,11 +1022,14 @@ def dtek_get_forecast_cached(force: bool = False) -> dict:
         return out
 
     parsed = _dtek_parse_restore_from_text(res.get("text") or "")
+    stale = _dtek_restore_is_stale(parsed)
+    parsed = _dtek_reject_stale_restore(parsed)
     out.update(parsed)
     out["ok"] = bool(parsed.get("ok"))
     out["ts_epoch"] = now_ts
     out["ts_kyiv"] = now_kyiv_iso()
-    _dtek_cache_save(out)
+    if not stale:
+        _dtek_cache_save(out)
     return out
 
 
@@ -1037,6 +1082,7 @@ def dtek_get_forecast_since_offline(offline_ts: float | None = None, force: bool
 
     text = (res.get("text") or "").strip()
     parsed = _dtek_parse_restore_from_text(text)
+    parsed = _dtek_reject_stale_restore(parsed)
     if isinstance(parsed, dict):
         out.update({
             "ok": bool(parsed.get("ok")),

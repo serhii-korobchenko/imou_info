@@ -2068,6 +2068,44 @@ def admin_dtek_notify():
 
 
 
+@app.post("/admin/dtek-graph-notify")
+def admin_dtek_graph_notify():
+    """Fetch the second DTEK schedule graph and send it to the configured Telegram chat."""
+    require_admin()
+    if not telegram_enabled():
+        return jsonify({"ok": False, "error": "telegram disabled or missing TELEGRAM_* env"}), 400
+
+    graph = dtek_get_schedule_graph_second(force=True)
+    if not isinstance(graph, dict) or not graph.get("ok") or not graph.get("path"):
+        return jsonify({
+            "ok": False,
+            "graph": graph,
+            "error": (graph.get("note") if isinstance(graph, dict) else "graph fetch failed"),
+        }), 502
+
+    photo_path = graph["path"]
+    try:
+        sent = telegram_send_photo(
+            photo_path,
+            caption=f"📈 ДТЕК графік відключень ({TELEGRAM_PARKING_DEVICE_NAME})",
+        )
+    finally:
+        try:
+            os.remove(photo_path)
+        except Exception:
+            pass
+
+    sent_ok = bool(isinstance(sent, dict) and sent.get("ok"))
+    return jsonify({
+        "ok": sent_ok,
+        "graph": {"ok": True, "note": graph.get("note") or ""},
+        "telegram": {
+            "ok": sent_ok,
+            "error": (sent.get("error") or sent.get("reason") or "") if isinstance(sent, dict) else "unexpected response",
+        },
+    }), (200 if sent_ok else 502)
+
+
 @app.post("/admin/clear-sheets-queue")
 def admin_clear_sheets_queue():
     require_admin()
@@ -2147,8 +2185,10 @@ def index():
       </div>
       <div style="margin-top:10px;">
         <div class="muted">DTEK / Telethon:</div>
-        <button onclick="adminDtekCheck()">Перевірити DTEK/Telethon</button>
-        <pre id="dtekCheckResult" style="white-space:pre-wrap; margin:8px 0 0;"></pre>
+        <button onclick="adminJsonRequest('/admin/dtek-check', 'GET')">Перевірити DTEK/Telethon</button>
+        <button onclick="adminJsonRequest('/admin/dtek-forecast?force=1', 'GET')">Перевірити прогноз ДТЕК</button>
+        <button onclick="adminJsonRequest('/admin/dtek-graph-notify', 'POST')">Отримати й надіслати графік</button>
+        <pre id="dtekResult" style="white-space:pre-wrap; margin:8px 0 0;"></pre>
       </div>
       <div style="margin-top:10px;">
         <div class="muted">Maintenance:</div>
@@ -2222,7 +2262,7 @@ def index():
 <script>
   const ADMIN_KEY_PRESENT = "{{ admin_key_present }}";
 
-  async function adminDtekCheck() {
+  async function adminJsonRequest(path, method) {
     if (!ADMIN_KEY_PRESENT) {
       alert("ADMIN_KEY is not set on server.");
       return;
@@ -2230,11 +2270,13 @@ def index():
     const key = prompt("Enter ADMIN_KEY:");
     if (!key) return;
 
-    const output = document.getElementById("dtekCheckResult");
+    const output = document.getElementById("dtekResult");
     output.textContent = "Перевірка...";
     try {
-      const r = await fetch("/admin/dtek-check", {
-        headers: { "X-Admin-Key": key }
+      const r = await fetch(path, {
+        method: method,
+        headers: { "Content-Type": "application/json", "X-Admin-Key": key },
+        body: method === "POST" ? "{}" : undefined
       });
       const t = await r.text();
       try {

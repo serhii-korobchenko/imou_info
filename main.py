@@ -171,6 +171,10 @@ DTEK_TG_SESSION_FILE = os.getenv("DTEK_TG_SESSION_FILE", os.path.join(DATA_DIR, 
 # You may need to adjust if DTEK changes labels.
 DTEK_MENU_SEQUENCE = os.getenv("DTEK_MENU_SEQUENCE", "💡 Можливі відключення").strip()
 DTEK_FETCH_TIMEOUT_SEC = int(os.getenv("DTEK_FETCH_TIMEOUT_SEC", "20"))
+# Keep synchronous Flask requests below Gunicorn's default 30-second worker timeout.
+# A larger DTEK_FETCH_TIMEOUT_SEC may still be used by older deployments, so cap
+# the complete Telethon operation independently.
+DTEK_REQUEST_TIMEOUT_SEC = min(25, max(10, int(os.getenv("DTEK_REQUEST_TIMEOUT_SEC", "25"))))
 DTEK_FORECAST_CACHE_SEC = int(os.getenv("DTEK_FORECAST_CACHE_SEC", "300"))
 DTEK_ATTACH_TO_OFFLINE_ALERT = env_bool("DTEK_ATTACH_TO_OFFLINE_ALERT", True)
 
@@ -816,7 +820,10 @@ async def _dtek_fetch_text_via_telethon(since_ts: float | None = None) -> dict:
     if not steps:
         steps = ["💡 Можливі відключення"]
 
-    per_msg_timeout = max(10, int(DTEK_FETCH_TIMEOUT_SEC or 20))
+    per_msg_timeout = min(
+        max(5, int(DTEK_FETCH_TIMEOUT_SEC or 20)),
+        max(5, DTEK_REQUEST_TIMEOUT_SEC - 7),
+    )
     history_limit = max(40, int(os.getenv("DTEK_HISTORY_LIMIT", "60")))
 
     def _safe_text(m) -> str:
@@ -990,12 +997,12 @@ def dtek_get_forecast_cached(force: bool = False) -> dict:
 
     # Fetch + parse (best-effort)
     try:
-        res = asyncio.run(asyncio.wait_for(_dtek_fetch_text_via_telethon(), timeout=max(10, DTEK_FETCH_TIMEOUT_SEC + 8)))
+        res = asyncio.run(asyncio.wait_for(_dtek_fetch_text_via_telethon(), timeout=DTEK_REQUEST_TIMEOUT_SEC))
     except RuntimeError:
         # If we're already in an event loop (rare in Flask), create a new loop
         loop = asyncio.new_event_loop()
         try:
-            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_text_via_telethon(), timeout=max(10, DTEK_FETCH_TIMEOUT_SEC + 8)))
+            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_text_via_telethon(), timeout=DTEK_REQUEST_TIMEOUT_SEC))
         finally:
             try:
                 loop.close()
@@ -1049,11 +1056,11 @@ def dtek_get_forecast_since_offline(offline_ts: float | None = None, force: bool
 
     # Always fetch (best-effort) because this is used for the delayed OFFLINE notification.
     try:
-        res = asyncio.run(asyncio.wait_for(_dtek_fetch_text_via_telethon(since_ts=offline_ts), timeout=max(12, DTEK_FETCH_TIMEOUT_SEC + 8)))
+        res = asyncio.run(asyncio.wait_for(_dtek_fetch_text_via_telethon(since_ts=offline_ts), timeout=DTEK_REQUEST_TIMEOUT_SEC))
     except RuntimeError:
         loop = asyncio.new_event_loop()
         try:
-            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_text_via_telethon(since_ts=offline_ts), timeout=max(12, DTEK_FETCH_TIMEOUT_SEC + 8)))
+            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_text_via_telethon(since_ts=offline_ts), timeout=DTEK_REQUEST_TIMEOUT_SEC))
         finally:
             try:
                 loop.close()
@@ -1112,11 +1119,11 @@ def dtek_get_schedule_graph_second(force: bool = True) -> dict:
         return {"ok": False, "path": None, "note": reason, "raw": ""}
 
     try:
-        res = asyncio.run(asyncio.wait_for(_dtek_fetch_graph_via_telethon(), timeout=max(10, DTEK_FETCH_TIMEOUT_SEC)))
+        res = asyncio.run(asyncio.wait_for(_dtek_fetch_graph_via_telethon(), timeout=DTEK_REQUEST_TIMEOUT_SEC))
     except RuntimeError:
         loop = asyncio.new_event_loop()
         try:
-            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_graph_via_telethon(), timeout=max(10, DTEK_FETCH_TIMEOUT_SEC)))
+            res = loop.run_until_complete(asyncio.wait_for(_dtek_fetch_graph_via_telethon(), timeout=DTEK_REQUEST_TIMEOUT_SEC))
         finally:
             try:
                 loop.close()
@@ -1269,7 +1276,11 @@ async def _dtek_fetch_graph_via_telethon() -> dict:
 
         # Poll for new images
         t0 = time.monotonic()
-        while (time.monotonic() - t0) < float(DTEK_FETCH_TIMEOUT_SEC or 20):
+        graph_poll_timeout = min(
+            max(5, int(DTEK_FETCH_TIMEOUT_SEC or 20)),
+            max(5, DTEK_REQUEST_TIMEOUT_SEC - 7),
+        )
+        while (time.monotonic() - t0) < float(graph_poll_timeout):
             try:
                 msgs = await client.get_messages(bot, limit=30)
                 new_msgs = [m for m in msgs if int(getattr(m, "id", 0) or 0) > baseline_id]
@@ -2058,7 +2069,7 @@ def admin_dtek_check():
         res = asyncio.run(
             asyncio.wait_for(
                 _dtek_fetch_text_via_telethon(),
-                timeout=max(10, DTEK_FETCH_TIMEOUT_SEC + 8),
+                timeout=DTEK_REQUEST_TIMEOUT_SEC,
             )
         )
     except RuntimeError:
@@ -2067,7 +2078,7 @@ def admin_dtek_check():
             res = loop.run_until_complete(
                 asyncio.wait_for(
                     _dtek_fetch_text_via_telethon(),
-                    timeout=max(10, DTEK_FETCH_TIMEOUT_SEC + 8),
+                    timeout=DTEK_REQUEST_TIMEOUT_SEC,
                 )
             )
         finally:

@@ -102,14 +102,12 @@ def _configured_destination_matches(chat: dict) -> bool:
     chat_id = chat.get("id")
     username = (chat.get("username") or "").strip()
 
-    # Numeric Telegram chat/channel ID, e.g. -1001234567890
     try:
         if chat_id is not None and str(int(chat_id)) == str(int(target)):
             return True
     except Exception:
         pass
 
-    # Username form, e.g. @IMOU_cameras_info
     if target.startswith("@") and username:
         return username.casefold() == target[1:].casefold()
     if username:
@@ -133,14 +131,6 @@ def _is_channel_admin(user_id: int) -> bool:
 
 
 def _authorized_for_commands(*, chat: dict, user_id, is_channel_post: bool) -> bool:
-    """
-    Authorization rules:
-    - A command posted directly in the configured IMOU channel is allowed.
-      Telegram channel posts often have no ``from`` user, so user-based checks
-      cannot be used there.
-    - In private/group chats, explicit TELEGRAM_COMMAND_USER_IDS wins.
-    - Otherwise allow administrators of the configured destination channel.
-    """
     if is_channel_post and _configured_destination_matches(chat):
         return True
 
@@ -165,16 +155,29 @@ def _webhook_secret() -> str:
     return hashlib.sha256(("imou-telegram-webhook:" + token).encode("utf-8")).hexdigest()
 
 
+def _normalize_https_base_url(value: str) -> str:
+    value = (value or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if value.startswith("https://"):
+        return value
+    if value.startswith("http://"):
+        return "https://" + value[len("http://"):]
+    return "https://" + value
+
+
 def _webhook_base_url() -> str:
-    base = (os.getenv("TELEGRAM_WEBHOOK_BASE_URL", "") or "").strip().rstrip("/")
+    # Telegram requires an HTTPS webhook URL. Railway/public base variables are
+    # often stored as a bare hostname, so normalize them before setWebhook.
+    base = _normalize_https_base_url(os.getenv("TELEGRAM_WEBHOOK_BASE_URL", ""))
     if base:
         return base
-    base = (main.PUBLIC_BASE_URL or "").strip().rstrip("/")
+    base = _normalize_https_base_url(main.PUBLIC_BASE_URL)
     if base:
         return base
     railway_domain = (os.getenv("RAILWAY_PUBLIC_DOMAIN", "") or "").strip().strip("/")
     if railway_domain:
-        return f"https://{railway_domain}"
+        return _normalize_https_base_url(railway_domain)
     return ""
 
 
@@ -287,14 +290,12 @@ def telegram_command_webhook():
 
 @app.get("/admin/telegram-webhook-info")
 def admin_telegram_webhook_info():
-    """Show Telegram webhook status for diagnostics."""
     main.require_admin()
     return main.jsonify(_telegram_api("getWebhookInfo", timeout=20))
 
 
 @app.post("/admin/telegram-webhook-register")
 def admin_telegram_webhook_register():
-    """Re-register Telegram webhook manually."""
     main.require_admin()
     return main.jsonify(_register_telegram_webhook())
 

@@ -1,10 +1,12 @@
 """Application entrypoint with Telegram command handling.
 
 Wraps the existing Flask app from ``main.py`` without changing the current
-IMOU/OpenClaw/DTEK logic. Adds Telegram Bot API webhook commands:
+IMOU/OpenClaw/DTEK logic. Adds Telegram Bot API webhook commands that work both
+in a private chat with the bot and directly in the configured Telegram channel.
 
+Commands:
 - /graph - fetch and send the second DTEK outage schedule graph
-- /id    - show Telegram user/chat IDs for access configuration
+- /id    - show Telegram user/chat IDs for diagnostics
 """
 
 import hashlib
@@ -91,6 +93,31 @@ def _configured_command_user_ids() -> set[int]:
     return out
 
 
+def _configured_destination_matches(chat: dict) -> bool:
+    """True when this Telegram chat is the configured IMOU destination channel/chat."""
+    target = (main.TELEGRAM_CHAT_ID or "").strip()
+    if not target or not isinstance(chat, dict):
+        return False
+
+    chat_id = chat.get("id")
+    username = (chat.get("username") or "").strip()
+
+    # Numeric Telegram chat/channel ID, e.g. -1001234567890
+    try:
+        if chat_id is not None and str(int(chat_id)) == str(int(target)):
+            return True
+    except Exception:
+        pass
+
+    # Username form, e.g. @IMOU_cameras_info
+    if target.startswith("@") and username:
+        return username.casefold() == target[1:].casefold()
+    if username:
+        return username.casefold() == target.lstrip("@").casefold()
+
+    return False
+
+
 def _is_channel_admin(user_id: int) -> bool:
     target = (main.TELEGRAM_CHAT_ID or "").strip()
     if not target or not user_id:
@@ -105,11 +132,27 @@ def _is_channel_admin(user_id: int) -> bool:
     return member.get("status") in {"creator", "administrator"}
 
 
-def _authorized_for_commands(user_id: int) -> bool:
+def _authorized_for_commands(*, chat: dict, user_id, is_channel_post: bool) -> bool:
+    """
+    Authorization rules:
+    - A command posted directly in the configured IMOU channel is allowed.
+      Telegram channel posts often have no ``from`` user, so user-based checks
+      cannot be used there.
+    - In private/group chats, explicit TELEGRAM_COMMAND_USER_IDS wins.
+    - Otherwise allow administrators of the configured destination channel.
+    """
+    if is_channel_post and _configured_destination_matches(chat):
+        return True
+
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+
     explicit = _configured_command_user_ids()
     if explicit:
-        return user_id in explicit
-    return _is_channel_admin(user_id)
+        return uid in explicit
+    return _is_channel_admin(uid)
 
 
 def _webhook_secret() -> str:
@@ -135,7 +178,7 @@ def _webhook_base_url() -> str:
     return ""
 
 
-def _graph_worker(chat_id, user_id: int):
+def _graph_worker(chat_id, actor_label: str):
     try:
         result = main.dtek_get_schedule_graph_second(force=True)
         if isinstance(result, dict) and result.get("ok") and result.get("path"):
@@ -156,7 +199,7 @@ def _graph_worker(chat_id, user_id: int):
             chat_id,
             f"⚠️ Не вдалося отримати графік ДТЕК: {note}" if note else "⚠️ Не вдалося отримати графік ДТЕК. Спробуйте пізніше.",
         )
-        app.logger.warning("Telegram /graph DTEK fetch failed for user %s: %s", user_id, result)
+        app.logger.warning("Telegram /graph DTEK fetch failed for %s: %s", actor_label, result)
     except Exception as exc:
         app.logger.exception("Telegram /graph worker failed")
         _send_message(chat_id, f"⚠️ Помилка під час отримання графіка ДТЕК: {exc}")
@@ -171,10 +214,12 @@ def telegram_command_webhook():
             return {"ok": False}, 403
 
     update = main.request.get_json(silent=True) or {}
+    is_channel_post = bool(update.get("channel_post"))
     message = update.get("message") or update.get("channel_post") or {}
     text = str(message.get("text") or "").strip()
     chat = message.get("chat") or {}
     sender = message.get("from") or {}
+    sender_chat = message.get("sender_chat") or {}
     chat_id = chat.get("id")
     user_id = sender.get("id")
 
@@ -184,26 +229,43 @@ def telegram_command_webhook():
     first = text.split(None, 1)[0]
     command = first.split("@", 1)[0].casefold()
 
+    app.logger.info(
+        "Telegram command received: command=%s chat_id=%s channel_post=%s user_id=%s sender_chat_id=%s",
+        command,
+        chat_id,
+        is_channel_post,
+        user_id,
+        sender_chat.get("id"),
+    )
+
     if command == "/id":
-        _send_message(chat_id, f"Ваш Telegram user ID: {user_id}\nChat ID: {chat_id}")
+        username = chat.get("username") or ""
+        lines = [f"Chat ID: {chat_id}"]
+        if username:
+            lines.append(f"Chat: @{username}")
+        if user_id:
+            lines.insert(0, f"Ваш Telegram user ID: {user_id}")
+        elif is_channel_post:
+            lines.insert(0, "Команда надіслана від імені каналу; user ID у channel_post відсутній.")
+        _send_message(chat_id, "\n".join(lines))
         return {"ok": True}
 
     if command in {"/start", "/help"}:
         _send_message(
             chat_id,
-            "Доступні команди:\n/graph — отримати другий графік відключень ДТЕК\n/id — показати Telegram user ID",
+            "Доступні команди:\n/graph — отримати другий графік відключень ДТЕК\n/id — показати Telegram user/chat ID",
         )
         return {"ok": True}
 
     if command != "/graph":
         return {"ok": True}
 
-    if not user_id or not _authorized_for_commands(int(user_id)):
+    if not _authorized_for_commands(chat=chat, user_id=user_id, is_channel_post=is_channel_post):
         _send_message(
             chat_id,
-            "⛔ Команда недоступна для цього користувача.\n"
-            f"Ваш Telegram user ID: {user_id}\n"
-            "Додайте його в Railway Variables: TELEGRAM_COMMAND_USER_IDS.",
+            "⛔ Команда /graph недоступна в цьому чаті.\n"
+            f"Chat ID: {chat_id}\n"
+            f"User ID: {user_id}",
         )
         return {"ok": True}
 
@@ -212,9 +274,10 @@ def telegram_command_webhook():
         return {"ok": True}
 
     _send_message(chat_id, "⏳ Отримую актуальний графік ДТЕК…")
+    actor = f"channel {chat_id}" if is_channel_post else f"user {user_id}"
     worker = threading.Thread(
         target=_graph_worker,
-        args=(chat_id, int(user_id)),
+        args=(chat_id, actor),
         name="telegram-dtek-graph",
         daemon=True,
     )
@@ -222,17 +285,34 @@ def telegram_command_webhook():
     return {"ok": True}
 
 
-def _register_telegram_webhook():
+@app.get("/admin/telegram-webhook-info")
+def admin_telegram_webhook_info():
+    """Show Telegram webhook status for diagnostics."""
+    main.require_admin()
+    return main.jsonify(_telegram_api("getWebhookInfo", timeout=20))
+
+
+@app.post("/admin/telegram-webhook-register")
+def admin_telegram_webhook_register():
+    """Re-register Telegram webhook manually."""
+    main.require_admin()
+    return main.jsonify(_register_telegram_webhook())
+
+
+def _register_telegram_webhook() -> dict:
     if not main.telegram_enabled():
-        app.logger.info("Telegram webhook not registered: Telegram notifications are disabled")
-        return
+        res = {"ok": False, "description": "Telegram notifications are disabled"}
+        app.logger.info("Telegram webhook not registered: %s", res["description"])
+        return res
 
     base = _webhook_base_url()
     if not base:
-        app.logger.warning(
-            "Telegram webhook not registered: set PUBLIC_BASE_URL, TELEGRAM_WEBHOOK_BASE_URL, or RAILWAY_PUBLIC_DOMAIN"
-        )
-        return
+        res = {
+            "ok": False,
+            "description": "set PUBLIC_BASE_URL, TELEGRAM_WEBHOOK_BASE_URL, or RAILWAY_PUBLIC_DOMAIN",
+        }
+        app.logger.warning("Telegram webhook not registered: %s", res["description"])
+        return res
 
     secret = _webhook_secret()
     data = {
@@ -246,11 +326,11 @@ def _register_telegram_webhook():
     res = _telegram_api("setWebhook", data=data, timeout=20)
     if not res.get("ok"):
         app.logger.warning("Telegram setWebhook failed: %s", res)
-        return
+        return res
 
     commands = [
         {"command": "graph", "description": "Отримати другий графік відключень ДТЕК"},
-        {"command": "id", "description": "Показати Telegram user ID"},
+        {"command": "id", "description": "Показати Telegram user/chat ID"},
     ]
     cmd_res = _telegram_api(
         "setMyCommands",
@@ -261,6 +341,8 @@ def _register_telegram_webhook():
         app.logger.warning("Telegram setMyCommands failed: %s", cmd_res)
     else:
         app.logger.info("Telegram command webhook ready at %s/telegram/webhook", base)
+
+    return {"ok": True, "webhook": res, "commands": cmd_res, "url": f"{base}/telegram/webhook"}
 
 
 def _delayed_register_webhook():

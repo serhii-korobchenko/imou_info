@@ -1,0 +1,6 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "startCommand": "gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT --access-logfile - --error-logfile - app_entry:app"
+  }
+}

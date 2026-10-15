@@ -4,6 +4,11 @@ Wraps the existing Flask app from ``main.py`` without changing the current
 IMOU/OpenClaw/DTEK logic. Adds Telegram Bot API webhook commands that work both
 in a private chat with the bot and directly in the configured Telegram channel.
 
+Also adds an in-process deduplication guard for repeated IMOU online/offline
+callbacks. IMOU may deliver the same status transition more than once almost
+simultaneously; without a guard, concurrent Gunicorn threads can both observe
+the old status and both send the same Telegram notification.
+
 Commands:
 - /graph - fetch and send the second DTEK outage schedule graph
 - /id    - show Telegram user/chat IDs for diagnostics
@@ -20,6 +25,55 @@ import requests
 import main
 
 app = main.app
+
+
+# ---------------------------------------------------------------------------
+# IMOU status notification deduplication
+# ---------------------------------------------------------------------------
+# The main callback already checks prev_status != status, but two callbacks can
+# arrive concurrently and both read the same previous DB value before either
+# request writes the new status. That race produces two identical Telegram
+# messages (for example two "🟢 ДАЛИ СВІТЛО" messages at the same moment).
+#
+# Keep the original implementation intact and guard only the notification call.
+# The state stores the most recently *accepted* status per device. A real
+# online -> offline -> online flap is still allowed, because the intermediate
+# status changes the stored value. Only repeated identical callbacks are
+# suppressed within the short window.
+_IMOU_NOTIFY_DEDUP_LOCK = threading.Lock()
+_IMOU_NOTIFY_LAST = {}
+_IMOU_NOTIFY_DEDUP_SEC = max(1, int(os.getenv("TELEGRAM_STATUS_DEDUP_SEC", "30")))
+_original_maybe_notify_telegram_device_status = main.maybe_notify_telegram_device_status
+
+
+def _dedup_maybe_notify_telegram_device_status(device_id: str, status: str, interval_note: str = ""):
+    st = main._normalize_status(status)
+    now_ts = time.time()
+
+    if device_id and st in ("online", "offline"):
+        with _IMOU_NOTIFY_DEDUP_LOCK:
+            previous = _IMOU_NOTIFY_LAST.get(device_id)
+            if previous:
+                prev_status, prev_ts = previous
+                if prev_status == st and (now_ts - float(prev_ts)) < _IMOU_NOTIFY_DEDUP_SEC:
+                    app.logger.info(
+                        "Suppressing duplicate IMOU Telegram status notification: device_id=%s status=%s age=%.3fs",
+                        device_id,
+                        st,
+                        now_ts - float(prev_ts),
+                    )
+                    return
+
+            # Record before the network send so a second concurrent callback is
+            # blocked immediately rather than waiting for Telegram HTTP I/O.
+            _IMOU_NOTIFY_LAST[device_id] = (st, now_ts)
+
+    return _original_maybe_notify_telegram_device_status(device_id, status, interval_note)
+
+
+# imou_callback() resolves this name from the main module at runtime, so replacing
+# it here protects the existing callback without rewriting main.py.
+main.maybe_notify_telegram_device_status = _dedup_maybe_notify_telegram_device_status
 
 
 def _telegram_token() -> str:
@@ -167,8 +221,6 @@ def _normalize_https_base_url(value: str) -> str:
 
 
 def _webhook_base_url() -> str:
-    # Telegram requires an HTTPS webhook URL. Railway/public base variables are
-    # often stored as a bare hostname, so normalize them before setWebhook.
     base = _normalize_https_base_url(os.getenv("TELEGRAM_WEBHOOK_BASE_URL", ""))
     if base:
         return base
